@@ -25,7 +25,8 @@ impl CompactMcp {
             tool_router: Self::analysis_router()
                 + Self::toolchain_router()
                 + Self::fmt_router()
-                + Self::compile_router(),
+                + Self::compile_router()
+                + Self::artifacts_router(),
         }
     }
 

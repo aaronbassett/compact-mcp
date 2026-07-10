@@ -1,5 +1,192 @@
 use rmcp::{ServiceExt, model::CallToolRequestParams};
 
+const CI_FIXTURE: &str = r#"{
+  "compiler-version":"0.31.1","language-version":"0.23.0","runtime-version":"0.16.0",
+  "circuits":[
+    {"name":"increment","pure":false,"proof":true,"arguments":[],"result-type":{"type-name":"Tuple","types":[]}},
+    {"name":"reveal","pure":false,"proof":false,"arguments":[],"result-type":{"type-name":"Field"}}
+  ],
+  "witnesses":[],"contracts":[],"ledger":[]
+}"#;
+const ZKIR_FIXTURE: &str = r#"{"version":{"major":2,"minor":0},"do_communications_commitment":true,"num_inputs":0,"instructions":[{"op":"load_imm","imm":"01"},{"op":"add"}]}"#;
+
+/// Builds a fake skip-zk target dir named `build` under `root`: parsed
+/// contract-info.json with two circuits (one `proof:true`, one `proof:false`)
+/// and a `.zkir` for only the `proof:true` circuit — `reveal` intentionally
+/// has no zkir file, matching a real skip-zk build's layout.
+fn write_build_fixture(root: &std::path::Path) {
+    let compiler_dir = root.join("build/compiler");
+    std::fs::create_dir_all(&compiler_dir).unwrap();
+    std::fs::write(compiler_dir.join("contract-info.json"), CI_FIXTURE).unwrap();
+    let zkir_dir = root.join("build/zkir");
+    std::fs::create_dir_all(&zkir_dir).unwrap();
+    std::fs::write(zkir_dir.join("increment.zkir"), ZKIR_FIXTURE).unwrap();
+}
+
+#[tokio::test]
+async fn artifacts_tool_scans_a_build_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    write_build_fixture(dir.path());
+    let ws = compact_mcp_core::Workspace::new(dir.path()).unwrap();
+
+    let (client_t, server_t) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        let _ = compact_mcp::server::CompactMcp::new(ws)
+            .serve(server_t)
+            .await
+            .expect("server failed to start")
+            .waiting()
+            .await;
+    });
+    let client = ().serve(client_t).await.unwrap();
+
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("artifacts").with_arguments(
+                serde_json::json!({ "target_dir": "build" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_ne!(res.is_error, Some(true), "{:?}", res.content);
+    let text = format!("{:?}", res.content);
+    assert!(text.contains("increment"), "{text}");
+    assert!(text.contains("reveal"), "{text}");
+    assert!(text.contains("proving_keys"), "{text}");
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn artifacts_tool_missing_dir_is_is_error_not_protocol_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = compact_mcp_core::Workspace::new(dir.path()).unwrap();
+
+    let (client_t, server_t) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        let _ = compact_mcp::server::CompactMcp::new(ws)
+            .serve(server_t)
+            .await
+            .expect("server failed to start")
+            .waiting()
+            .await;
+    });
+    let client = ().serve(client_t).await.unwrap();
+
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("artifacts").with_arguments(
+                serde_json::json!({ "target_dir": "nope" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.is_error,
+        Some(true),
+        "a missing target dir must be an is_error result, not a protocol error: {:?}",
+        res.content
+    );
+    let text = format!("{:?}", res.content);
+    assert!(text.contains("artifact missing"), "{text}");
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn zkir_stats_tool_unknown_circuit_lists_available() {
+    let dir = tempfile::tempdir().unwrap();
+    write_build_fixture(dir.path());
+    let ws = compact_mcp_core::Workspace::new(dir.path()).unwrap();
+
+    let (client_t, server_t) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        let _ = compact_mcp::server::CompactMcp::new(ws)
+            .serve(server_t)
+            .await
+            .expect("server failed to start")
+            .waiting()
+            .await;
+    });
+    let client = ().serve(client_t).await.unwrap();
+
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("zkir_stats").with_arguments(
+                serde_json::json!({ "target_dir": "build", "circuit": "ghost" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.is_error,
+        Some(true),
+        "an unknown circuit must be an is_error result: {:?}",
+        res.content
+    );
+    let text = format!("{:?}", res.content);
+    assert!(text.contains("available"), "{text}");
+    assert!(
+        text.contains("increment"),
+        "the agent must SEE the real circuit names: {text}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn zkir_stats_tool_reports_stats_and_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    write_build_fixture(dir.path());
+    let ws = compact_mcp_core::Workspace::new(dir.path()).unwrap();
+
+    let (client_t, server_t) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        let _ = compact_mcp::server::CompactMcp::new(ws)
+            .serve(server_t)
+            .await
+            .expect("server failed to start")
+            .waiting()
+            .await;
+    });
+    let client = ().serve(client_t).await.unwrap();
+
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("zkir_stats").with_arguments(
+                serde_json::json!({ "target_dir": "build" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_ne!(res.is_error, Some(true), "{:?}", res.content);
+    let text = format!("{:?}", res.content);
+    assert!(text.contains("increment"), "{text}");
+    assert!(
+        text.contains("load_imm"),
+        "expected opcode histogram from the parsed zkir: {text}"
+    );
+    assert!(text.contains("absent"), "{text}");
+    assert!(
+        text.contains("reveal"),
+        "reveal is proof:false and must be reported absent: {text}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
 #[tokio::test]
 async fn lists_the_four_analysis_tools_and_diagnoses_a_broken_contract() {
     let dir = tempfile::tempdir().unwrap();
