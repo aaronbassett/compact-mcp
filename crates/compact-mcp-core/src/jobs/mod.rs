@@ -8,6 +8,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::CoreError;
 
+pub mod gate;
+pub use gate::BuildGate;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskState {
