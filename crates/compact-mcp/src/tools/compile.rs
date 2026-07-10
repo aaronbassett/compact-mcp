@@ -107,14 +107,19 @@ impl CompactMcp {
         // handler surfaces as isError (never an opaque McpError). Hold the permit
         // for the whole compile. Use the task cancel token when running as a task
         // (a fresh, never-cancelled token otherwise) and the configured timeout.
-        let _permit = self.gate.acquire().await?;
+        let ct = self.current_cancel_token();
+        // Race the queue wait against cancellation: a task cancelled WHILE QUEUED
+        // must free its slot at once (dropping the acquire future runs the gate's
+        // queue-counter guard and releases it) instead of holding it until its
+        // turn finally comes up. A fresh sync-call token never fires this branch.
+        let _permit = tokio::select! {
+            biased;
+            _ = ct.cancelled() => return Err(CoreError::Cancelled),
+            p = self.gate.acquire() => p?,
+        };
         let out = self
             .toolchain
-            .compile(
-                &req,
-                self.current_cancel_token(),
-                Duration::from_secs(self.compile_timeout_secs),
-            )
+            .compile(&req, ct, Duration::from_secs(self.compile_timeout_secs))
             .await?;
 
         Ok((out, target_dir))

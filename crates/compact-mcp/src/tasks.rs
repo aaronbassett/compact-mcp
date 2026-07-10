@@ -14,7 +14,9 @@ use rmcp::{
 use crate::server::{CompactMcp, TASK_CANCEL};
 
 const POLL_INTERVAL_MS: u64 = 2_000;
-const RELATED_TASK_KEY: &str = "io.modelcontextprotocol/related-task";
+// Reference rmcp's canonical constant rather than re-spelling the literal, so
+// the two can't silently drift on an rmcp bump.
+const RELATED_TASK_KEY: &str = rmcp::model::RelatedTaskMetadata::META_KEY;
 
 fn rfc3339(t: SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()
@@ -193,6 +195,8 @@ impl CompactMcp {
 
     pub(crate) async fn list_tasks_impl(
         &self,
+        // Pagination cursor intentionally ignored: this is a small in-memory
+        // store, so every call returns the full (sorted) list with no cursor.
         _request: Option<PaginatedRequestParams>,
     ) -> Result<ListTasksResult, McpError> {
         // Advertised on stdio only; HTTP cannot identify requestors (§7.2 of the spec).

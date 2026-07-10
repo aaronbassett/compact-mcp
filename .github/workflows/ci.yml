@@ -9,6 +9,9 @@ jobs:
         with: { components: rustfmt, clippy }
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
+      # The shipped binary has no `testing` feature; check that config compiles
+      # too, so production code can never start depending on test-only modules.
+      - run: cargo check --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked --features testing -- -D warnings
       - run: cargo test --workspace --locked --features testing
       - name: core must not depend on rmcp

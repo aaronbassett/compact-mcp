@@ -66,6 +66,15 @@ impl CompactMcp {
         self
     }
 
+    /// Whether to advertise and answer `tasks/list`. Stdio (a single trusted
+    /// client) leaves it on; the HTTP transport (Task 23) must set it `false`,
+    /// because `tasks/list` has no per-caller scoping and the id is the only
+    /// secret. The setter exists so that path has a seam to flip it.
+    pub fn with_advertise_task_list(mut self, advertise: bool) -> Self {
+        self.advertise_task_list = advertise;
+        self
+    }
+
     /// The task's cancel token when running inside `enqueue_task`'s scope, else a
     /// fresh (never-cancelled) token for a plain synchronous tool call.
     pub(crate) fn current_cancel_token(&self) -> tokio_util::sync::CancellationToken {
