@@ -167,6 +167,44 @@ async fn ast_symbols_and_stats_flag_over_depth_refusal() {
 }
 
 #[tokio::test]
+async fn toolchain_tool_surfaces_a_missing_binary_as_an_is_error_result() {
+    // Hermetic: no real toolchain needed. A bogus binary makes the subprocess
+    // spawn fail fast with `ToolchainNotFound`, which the tool must surface as a
+    // successful call with `isError: true` carrying the message — NOT as an
+    // opaque protocol error that rmcp would render as "internal error".
+    let dir = tempfile::tempdir().unwrap();
+    let ws = compact_mcp_core::Workspace::new(dir.path()).unwrap();
+    let tc = compact_mcp_core::Toolchain::new("compact-does-not-exist-xyz", None);
+    let (client_t, server_t) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        let _ = compact_mcp::server::CompactMcp::with_toolchain(ws, tc)
+            .serve(server_t)
+            .await
+            .expect("server failed to start")
+            .waiting()
+            .await;
+    });
+    let client = ().serve(client_t).await.unwrap();
+
+    let res = client
+        .call_tool(CallToolRequestParams::new("toolchain_list"))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.is_error,
+        Some(true),
+        "missing binary must be an is_error result: {:?}",
+        res.content
+    );
+    let text = format!("{:?}", res.content);
+    assert!(
+        text.contains("not found"),
+        "error result must carry the not-found message: {text}"
+    );
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
 #[cfg_attr(not(feature = "toolchain-tests"), ignore)]
 async fn versions_tool_reports_both_parsers_and_a_skew_verdict() {
     let dir = tempfile::tempdir().unwrap();

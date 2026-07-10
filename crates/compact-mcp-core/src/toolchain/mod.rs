@@ -89,14 +89,36 @@ impl Toolchain {
 }
 
 impl Toolchain {
+    /// Run and fail loudly on a non-zero exit (like [`Toolchain::line`], but
+    /// preserves the full multi-line output instead of collapsing to one line).
+    /// `run` alone never inspects `status`, so without this a failed `list`/
+    /// `check` would return `Ok` carrying error text and the caller would
+    /// misreport it as an empty list / not-up-to-date.
+    async fn run_checked(&self, args: &[&str]) -> Result<Output, CoreError> {
+        let out = self.run(args).await?;
+        if out.status != 0 {
+            return Err(CoreError::ToolchainFailed {
+                cmd: format!("{} {}", self.bin, args.join(" ")),
+                code: out.status,
+                stderr: out.stderr,
+            });
+        }
+        Ok(out)
+    }
+
     pub async fn list(&self) -> Result<String, CoreError> {
-        let out = self.run(&["list"]).await?;
-        Ok(out.stdout)
+        Ok(self.run_checked(&["list"]).await?.stdout)
     }
 
     pub async fn check(&self) -> Result<String, CoreError> {
-        let out = self.run(&["check"]).await?;
-        Ok(format!("{}{}", out.stdout, out.stderr))
+        let out = self.run_checked(&["check"]).await?;
+        // `compact check` reports its verdict on stdout and exits 0; stderr is
+        // usually empty. Join with a newline only when both are non-empty so
+        // the two streams never run together on one line.
+        Ok(match (out.stdout.is_empty(), out.stderr.is_empty()) {
+            (false, false) => format!("{}\n{}", out.stdout, out.stderr),
+            _ => format!("{}{}", out.stdout, out.stderr),
+        })
     }
 }
 

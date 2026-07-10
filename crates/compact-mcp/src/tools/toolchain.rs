@@ -8,19 +8,28 @@ use crate::server::CompactMcp;
 ///   `  0.31.0 - x86_macos, ...`
 /// The meaning of `→` is not documented upstream, so we surface it as `marked`
 /// and always return the raw text alongside.
+///
+/// We validate the version token with `semver` rather than a bare charset check:
+/// that both KEEPS a real version line that has no ` - <platforms>` suffix
+/// (e.g. `→ 0.31.1`) and REJECTS a non-version line whose leading token is all
+/// digits (e.g. a `2024 - Copyright ...` banner). The `raw` field always carries
+/// every line verbatim, so nothing this parser drops is truly lost.
 fn parse_list(stdout: &str) -> Vec<serde_json::Value> {
     stdout
         .lines()
         .filter_map(|line| {
             let marked = line.trim_start().starts_with('\u{2192}');
             let body = line.trim_start().trim_start_matches('\u{2192}').trim();
-            let (version, platforms) = body.split_once(" - ")?;
-            if !version.chars().next()?.is_ascii_digit() {
-                return None;
+            let (version, platforms) = match body.split_once(" - ") {
+                Some((v, p)) => (v.trim(), p.split(',').map(|s| s.trim()).collect::<Vec<_>>()),
+                None => (body, Vec::new()),
+            };
+            if semver::Version::parse(version).is_err() {
+                return None; // not a real version line (header, copyright, drift) — raw still carries it
             }
             Some(json!({
-                "version": version.trim(),
-                "platforms": platforms.split(',').map(|s| s.trim()).collect::<Vec<_>>(),
+                "version": version,
+                "platforms": platforms,
                 "marked": marked,
             }))
         })
@@ -35,40 +44,39 @@ impl CompactMcp {
                           the installed compiler."
     )]
     async fn versions(&self) -> Result<CallToolResult, McpError> {
-        let v = self
-            .toolchain
-            .versions()
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(Self::json_result(serde_json::to_value(v).unwrap(), false))
+        // A `CoreError` here (e.g. `compact` not on PATH) is a runtime/domain
+        // failure, not a request-shape problem. rmcp renders `Err(McpError)`
+        // opaquely — the caller would see "internal error", never our message —
+        // so we surface it as a successful call with `isError: true`, matching
+        // the analysis tools. `McpError` stays reserved for bad request shapes.
+        match self.toolchain.versions().await {
+            Ok(v) => Ok(Self::json_result(serde_json::to_value(v).unwrap(), false)),
+            Err(e) => Ok(Self::json_result(json!({ "error": e.to_string() }), true)),
+        }
     }
 
     #[tool(description = "List Compact compiler versions available to the toolchain.")]
     async fn toolchain_list(&self) -> Result<CallToolResult, McpError> {
-        let out = self
-            .toolchain
-            .list()
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(Self::json_result(
-            json!({ "versions": parse_list(&out), "raw": out }),
-            false,
-        ))
+        match self.toolchain.list().await {
+            Ok(out) => Ok(Self::json_result(
+                json!({ "versions": parse_list(&out), "raw": out }),
+                false,
+            )),
+            Err(e) => Ok(Self::json_result(json!({ "error": e.to_string() }), true)),
+        }
     }
 
     #[tool(
         description = "Check whether a newer Compact compiler is available. Performs network I/O."
     )]
     async fn toolchain_check(&self) -> Result<CallToolResult, McpError> {
-        let out = self
-            .toolchain
-            .check()
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(Self::json_result(
-            json!({ "up_to_date": out.contains("Up to date"), "raw": out.trim() }),
-            false,
-        ))
+        match self.toolchain.check().await {
+            Ok(out) => Ok(Self::json_result(
+                json!({ "up_to_date": out.contains("Up to date"), "raw": out }),
+                false,
+            )),
+            Err(e) => Ok(Self::json_result(json!({ "error": e.to_string() }), true)),
+        }
     }
 }
 
@@ -85,5 +93,24 @@ mod tests {
         assert_eq!(v[0]["marked"], true);
         assert_eq!(v[0]["platforms"][1], "aarch64_macos");
         assert_eq!(v[1]["marked"], false);
+    }
+
+    #[test]
+    fn a_digit_leading_non_version_line_is_not_fabricated() {
+        // `2024` has an all-digit leading token, so a bare charset check would
+        // wrongly emit it. `semver` rejects it — no fake version appears.
+        let v = parse_list("2024 - Copyright Notice\n");
+        assert!(v.is_empty(), "fabricated a version from a banner: {v:?}");
+    }
+
+    #[test]
+    fn a_real_version_with_no_platform_suffix_is_kept() {
+        // A `→ 0.31.1` line with no ` - <platforms>` suffix must NOT vanish:
+        // it is emitted with empty platforms and the `marked` flag preserved.
+        let v = parse_list("\u{2192} 0.31.1\n");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0]["version"], "0.31.1");
+        assert_eq!(v[0]["marked"], true);
+        assert_eq!(v[0]["platforms"], json!([]));
     }
 }
