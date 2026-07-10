@@ -41,27 +41,29 @@ impl Toolchain {
             return Err(CoreError::Cancelled);
         }
 
-        let mut args: Vec<String> = vec!["compile".into()];
-        if let Some(v) = self.compiler_version() {
-            args.push(format!("+{v}"));
-        }
+        // Build the trailing flags, then delegate the `["compile", "+VERSION"?]`
+        // prefix to `compile_argv` — its doc comment names it the single source
+        // of truth so the executed and error-reported argv can't drift.
+        let src = req.source.to_string_lossy();
+        let tgt = req.target_dir.to_string_lossy();
         // `--vscode` prints each error on a single line, for machine consumption.
-        args.push("--vscode".into());
+        let mut trailing: Vec<&str> = vec!["--vscode"];
         if req.skip_zk {
-            args.push("--skip-zk".into());
+            trailing.push("--skip-zk");
         }
         if req.no_communications_commitment {
-            args.push("--no-communications-commitment".into());
+            trailing.push("--no-communications-commitment");
         }
         if let Some(root) = &req.source_root {
-            args.push("--sourceRoot".into());
-            args.push(root.clone());
+            trailing.push("--sourceRoot");
+            trailing.push(root.as_str());
         }
-        args.push(req.source.to_string_lossy().into_owned());
-        args.push(req.target_dir.to_string_lossy().into_owned());
+        trailing.push(&src);
+        trailing.push(&tgt);
+        let argv = self.compile_argv(&trailing);
 
         let mut cmd = tokio::process::Command::new(self.bin());
-        cmd.args(&args)
+        cmd.args(&argv)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -86,11 +88,20 @@ impl Toolchain {
                 // still-owned (never polled) `wait_with_output` future is dropped,
                 // and `Child`'s `kill_on_drop` (set in `proc::spawn_group`) reaps
                 // the direct child through tokio's orphan queue.
-                proc::kill_group(pid);
+                //
+                // Guard `pid != 0`: `child.id()` is `Some` here today, but if a
+                // future refactor slips a `try_wait()` in before it, `pid` falls
+                // back to 0 and `killpg(0, ...)` would signal OUR OWN process
+                // group — a self-inflicted kill.
+                if pid != 0 {
+                    proc::kill_group(pid);
+                }
                 return Err(CoreError::Cancelled);
             }
             _ = tokio::time::sleep(timeout) => {
-                proc::kill_group(pid);
+                if pid != 0 {
+                    proc::kill_group(pid);
+                }
                 return Err(CoreError::Timeout(timeout));
             }
             out = child.wait_with_output() => out?,
@@ -115,7 +126,7 @@ impl Toolchain {
                 duration_ms,
             }),
             code => Err(CoreError::ToolchainFailed {
-                cmd: format!("{} {}", self.bin(), args.join(" ")),
+                cmd: format!("{} {}", self.bin(), argv.join(" ")),
                 code,
                 stderr: format!("{stderr}{stdout}"),
             }),

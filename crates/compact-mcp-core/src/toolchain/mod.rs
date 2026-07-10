@@ -37,10 +37,6 @@ impl Toolchain {
         &self.bin
     }
 
-    pub(crate) fn compiler_version(&self) -> Option<&str> {
-        self.compiler_version.as_deref()
-    }
-
     pub(crate) async fn run(&self, args: &[&str]) -> Result<Output, CoreError> {
         let out = Command::new(&self.bin)
             .args(args)
