@@ -79,6 +79,32 @@ impl CompactMcp {
         let id2 = id.clone();
         tokio::spawn(async move {
             let store = this.tasks.clone();
+
+            // If the work below UNWINDS (a panic in the tool) before reaching a
+            // `finish`, this guard marks the task Failed on drop. Without it a
+            // panicked task would stay `Working` forever: retention only reaps
+            // TERMINAL tasks, so it would never be GC'd, and any `tasks/result`
+            // that blocks waiting for it would hang indefinitely. `finish` is
+            // idempotent (no-ops once terminal), so after a normal completion or
+            // a cancel this guard's drop is a harmless no-op.
+            struct FinishGuard {
+                store: std::sync::Arc<compact_mcp_core::jobs::TaskStore>,
+                id: String,
+            }
+            impl Drop for FinishGuard {
+                fn drop(&mut self) {
+                    self.store.finish(
+                        &self.id,
+                        serde_json::json!({ "error": "task did not run to completion" }),
+                        true,
+                    );
+                }
+            }
+            let _finish_guard = FinishGuard {
+                store: store.clone(),
+                id: id2.clone(),
+            };
+
             store.set_status(&id2, "running");
             let out = TASK_CANCEL
                 .scope(cancel, async { this.call_tool(request, context).await })
