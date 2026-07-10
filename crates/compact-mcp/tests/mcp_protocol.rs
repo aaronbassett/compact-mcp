@@ -206,6 +206,102 @@ async fn toolchain_tool_surfaces_a_missing_binary_as_an_is_error_result() {
 
 #[tokio::test]
 #[cfg_attr(not(feature = "toolchain-tests"), ignore)]
+async fn format_tool_returns_formatted_text_without_touching_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = "pragma language_version >= 0.23;\nimport CompactStandardLibrary;\nexport ledger    a:Counter;\n";
+    std::fs::write(dir.path().join("m.compact"), original).unwrap();
+    let ws = compact_mcp_core::Workspace::new(dir.path()).unwrap();
+
+    let (client_t, server_t) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        let _ = compact_mcp::server::CompactMcp::new(ws)
+            .serve(server_t)
+            .await
+            .expect("server failed to start")
+            .waiting()
+            .await;
+    });
+    let client = ().serve(client_t).await.unwrap();
+
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("format").with_arguments(
+                serde_json::json!({ "path": "m.compact" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_ne!(res.is_error, Some(true));
+
+    let on_disk = std::fs::read_to_string(dir.path().join("m.compact")).unwrap();
+    assert_eq!(
+        on_disk, original,
+        "write defaults to false; the file must be untouched"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn format_tool_surfaces_a_missing_toolchain_as_an_is_error_result() {
+    // Hermetic: no real `compact` binary needed. The parse gate lives in core and
+    // runs before the subprocess is ever spawned, so a VALID contract sails
+    // through the gate and reaches `Toolchain::run`, where the bogus binary makes
+    // the spawn fail fast with `ToolchainNotFound`. That `CoreError` must surface
+    // as a successful call with `isError: true` carrying the message — never as
+    // an opaque protocol error (rmcp renders `Err(McpError)` as "internal error",
+    // dropping the actionable text).
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("x.compact"),
+        "pragma language_version >= 0.23;\n",
+    )
+    .unwrap();
+    let ws = compact_mcp_core::Workspace::new(dir.path()).unwrap();
+    let tc = compact_mcp_core::Toolchain::new("compact-does-not-exist-xyz", None);
+
+    let (client_t, server_t) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        let _ = compact_mcp::server::CompactMcp::with_toolchain(ws, tc)
+            .serve(server_t)
+            .await
+            .expect("server failed to start")
+            .waiting()
+            .await;
+    });
+    let client = ().serve(client_t).await.unwrap();
+
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("format").with_arguments(
+                serde_json::json!({ "path": "x.compact" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.is_error,
+        Some(true),
+        "missing toolchain must be an is_error result: {:?}",
+        res.content
+    );
+    let text = format!("{:?}", res.content);
+    assert!(
+        text.contains("not found"),
+        "error result must carry the not-found message: {text}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg_attr(not(feature = "toolchain-tests"), ignore)]
 async fn versions_tool_reports_both_parsers_and_a_skew_verdict() {
     let dir = tempfile::tempdir().unwrap();
     let ws = compact_mcp_core::Workspace::new(dir.path()).unwrap();

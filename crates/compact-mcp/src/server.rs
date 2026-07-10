@@ -22,7 +22,7 @@ impl CompactMcp {
         Self {
             workspace,
             toolchain,
-            tool_router: Self::analysis_router() + Self::toolchain_router(),
+            tool_router: Self::analysis_router() + Self::toolchain_router() + Self::fmt_router(),
         }
     }
 
