@@ -3,8 +3,10 @@
 pub mod analyze;
 pub mod diagnostic;
 pub mod error;
+pub mod toolchain;
 pub mod workspace;
 
 pub use diagnostic::{Diagnostic, Position, Severity, Source, Span};
 pub use error::CoreError;
+pub use toolchain::Toolchain;
 pub use workspace::{TempScope, Workspace};
