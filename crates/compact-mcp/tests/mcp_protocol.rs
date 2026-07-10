@@ -907,6 +907,66 @@ async fn witness_scaffold_tool_emits_a_typescript_stub() {
 
 #[tokio::test]
 #[cfg_attr(not(feature = "toolchain-tests"), ignore)]
+async fn witness_scaffold_tool_compiles_a_multi_file_contract_by_path() {
+    // A `path` to a contract that imports a sibling module must compile IN PLACE
+    // so the `import "./util"` resolves relative to the source file's directory.
+    // The prior copy-to-a-fresh-temp-dir behavior dropped the sibling and this
+    // would fail; guards the path-in-place fix. Verified live: this pair
+    // compiles exit 0 and lists witness `pick`.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("util.compact"),
+        "module util {\n  export circuit double(x: Field): Field { return x + x; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("main.compact"),
+        "pragma language_version >= 0.23;\nimport CompactStandardLibrary;\nimport \"./util\";\n\
+         export ledger n: Counter;\nwitness pick(k: Bytes<32>): Field;\n\
+         export circuit put(): [] { const v = double(pick(default<Bytes<32>>)); n.increment(1); }\n",
+    )
+    .unwrap();
+    let ws = compact_mcp_core::Workspace::new(dir.path()).unwrap();
+
+    let (client_t, server_t) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        let _ = compact_mcp::server::CompactMcp::new(ws)
+            .serve(server_t)
+            .await
+            .expect("server failed to start")
+            .waiting()
+            .await;
+    });
+    let client = ().serve(client_t).await.unwrap();
+
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("witness_scaffold").with_arguments(
+                serde_json::json!({ "path": "main.compact" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        res.is_error,
+        Some(true),
+        "a multi-file contract passed by path must scaffold: {:?}",
+        res.content
+    );
+    let text = format!("{:?}", res.content);
+    assert!(
+        text.contains("pick"),
+        "the witness must be scaffolded: {text}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg_attr(not(feature = "toolchain-tests"), ignore)]
 async fn versions_tool_reports_both_parsers_and_a_skew_verdict() {
     let dir = tempfile::tempdir().unwrap();
     let ws = compact_mcp_core::Workspace::new(dir.path()).unwrap();

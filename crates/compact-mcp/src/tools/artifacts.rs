@@ -70,12 +70,18 @@ impl CompactMcp {
         &self,
         Parameters(input): Parameters<crate::tools::SourceInput>,
     ) -> Result<CallToolResult, McpError> {
-        // read_input keeps McpError: the path/source XOR is a genuine
-        // request-shape error. Everything downstream is a runtime CoreError,
-        // surfaced as isError so the agent sees the message.
+        // read_input keeps McpError: the path/source XOR (plus the size and
+        // is-a-directory checks) is a genuine request-shape error. Everything
+        // downstream is a runtime CoreError, surfaced as isError so the agent
+        // sees the message.
         let (text, _) = self.read_input(&input)?;
-        match self.witness_scaffold_impl(text).await {
-            Ok((is_error, value)) => Ok(Self::json_result(value, is_error)),
+        match self.witness_scaffold_impl(&input, text).await {
+            Ok(ScaffoldOutcome::Stub(v)) => Ok(Self::json_result(v, false)),
+            // A contract that fails to compile is a diagnostic, surfaced as an
+            // isError result carrying the outcome — exactly as `compile` does.
+            Ok(ScaffoldOutcome::CompileFailed(out)) => {
+                Ok(Self::json_result(serde_json::to_value(out).unwrap(), true))
+            }
             Err(e) => Ok(Self::json_result(json!({ "error": e.to_string() }), true)),
         }
     }
@@ -137,26 +143,41 @@ impl CompactMcp {
     }
 }
 
+/// Outcome of `witness_scaffold_impl`. A typed alternative to a bare
+/// `(bool, Value)`: the handler maps each variant to its isError flag by
+/// construction, so the flag can't be accidentally inverted.
+enum ScaffoldOutcome {
+    /// A generated TypeScript stub (isError: false).
+    Stub(serde_json::Value),
+    /// The contract failed to compile — a diagnostic, surfaced as isError.
+    CompileFailed(compact_mcp_core::toolchain::compile::CompileOutcome),
+}
+
 impl CompactMcp {
     /// Fallible core of `witness_scaffold`, returning `CoreError` so it is mapped
-    /// once at the handler. `(is_error, payload)`: a broken contract is a
-    /// successful call with `isError: true` carrying the compile outcome, exactly
-    /// as `compile` treats `out.ok == false`.
+    /// once at the handler.
     async fn witness_scaffold_impl(
         &self,
+        input: &crate::tools::SourceInput,
         text: String,
-    ) -> Result<(bool, serde_json::Value), compact_mcp_core::CoreError> {
+    ) -> Result<ScaffoldOutcome, CoreError> {
         use compact_mcp_core::toolchain::compile::CompileRequest;
 
-        // The scope holds BOTH the input file and the output dir; it must stay
-        // alive until we have loaded contract-info.json below (it is a local, so
-        // it drops at the end of this function — after `info` is read).
+        // A `path` is compiled IN PLACE so relative imports to sibling modules
+        // resolve (mirroring `compile`/`format`); inline `source` is written into
+        // the throwaway scope. Build output always lands in that scope's `out/`,
+        // which we only read contract-info.json back from — nothing is left in
+        // the caller's workspace. `scope` is a local, so it (and the temp dir)
+        // lives until this function returns, past the compile and the load.
         let scope = self.workspace.temp_scope("scaffold")?;
-        let src = scope.write_file("input.compact", &text)?;
+        let source = match &input.path {
+            Some(p) => self.workspace.resolve(p)?,
+            None => scope.write_file("input.compact", &text)?,
+        };
         let target = scope.path().join("out");
 
         let req = CompileRequest {
-            source: src,
+            source,
             target_dir: target.clone(),
             skip_zk: true,
             no_communications_commitment: false,
@@ -172,15 +193,14 @@ impl CompactMcp {
             .await?;
 
         if !out.ok {
-            return Ok((true, serde_json::to_value(out).unwrap()));
+            return Ok(ScaffoldOutcome::CompileFailed(out));
         }
 
         let info = compact_mcp_core::artifacts::ContractInfo::load(
             &target.join("compiler/contract-info.json"),
         )?;
         let ts = compact_mcp_core::artifacts::scaffold::witnesses_ts(&info);
-        Ok((
-            false,
+        Ok(ScaffoldOutcome::Stub(
             json!({ "typescript": ts, "witness_count": info.witnesses.len() }),
         ))
     }
