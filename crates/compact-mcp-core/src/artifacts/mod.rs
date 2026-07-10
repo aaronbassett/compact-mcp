@@ -50,14 +50,21 @@ pub fn scan(target_dir: &Path) -> Result<Artifacts, CoreError> {
     collect(target_dir, target_dir, &mut files)?;
     files.sort();
 
+    // Resolve each candidate artifact and confirm the REAL path stays inside
+    // target_dir, mirroring `Workspace::resolve`'s canonicalize-and-contain
+    // invariant. `canonicalize` follows symlinks and fails on a non-existent
+    // path, so it doubles as the existence check AND rejects a symlink planted
+    // at (or above) the expected artifact path that points out of the workspace
+    // — a boundary `p.exists()` alone would follow straight through.
+    let canonical_root = target_dir.canonicalize().ok();
     let rel = |p: PathBuf| -> Option<String> {
-        p.exists()
-            .then(|| {
-                p.strip_prefix(target_dir)
-                    .ok()
-                    .map(|r| r.to_string_lossy().into_owned())
-            })
-            .flatten()
+        let root = canonical_root.as_ref()?;
+        if !p.canonicalize().ok()?.starts_with(root) {
+            return None;
+        }
+        p.strip_prefix(target_dir)
+            .ok()
+            .map(|r| r.to_string_lossy().into_owned())
     };
 
     let circuits: Vec<CircuitArtifact> = info
@@ -209,6 +216,29 @@ mod tests {
         );
         assert!(c.bzkir.is_none() && c.prover_key.is_none() && c.verifier_key.is_none());
         assert!(!a.proving_keys);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_artifact_pointing_outside_is_not_surfaced() {
+        // A safe circuit name, but its expected `.zkir` is a SYMLINK pointing at
+        // a file outside the workspace. `exists()` would follow it; scan must not
+        // surface (and zkir_stats must not read) an out-of-tree target.
+        let d = tempfile::tempdir().unwrap();
+        let t = d.path().join("target");
+        std::fs::create_dir_all(t.join("compiler")).unwrap();
+        std::fs::create_dir_all(t.join("zkir")).unwrap();
+        std::fs::write(t.join("compiler/contract-info.json"), CI).unwrap();
+        let outside = d.path().join("secret.zkir");
+        std::fs::write(&outside, "{}").unwrap();
+        std::os::unix::fs::symlink(&outside, t.join("zkir/increment.zkir")).unwrap();
+
+        let a = scan(&t).unwrap();
+        let inc = a.circuits.iter().find(|c| c.name == "increment").unwrap();
+        assert!(
+            inc.zkir.is_none(),
+            "a symlinked artifact pointing outside the workspace must not be surfaced"
+        );
     }
 
     #[cfg(unix)]
