@@ -12,7 +12,11 @@ jobs:
       - run: cargo test --workspace
       - name: core must not depend on rmcp
         run: |
-          if cargo tree -p compact-mcp-core --prefix none | grep -qx 'rmcp v.*'; then
+          # Write to a file first: piping straight into grep makes a `cargo tree`
+          # failure indistinguishable from "no rmcp found", so the gate would
+          # silently pass when the tool itself broke.
+          cargo tree -p compact-mcp-core --prefix none > core-tree.txt
+          if grep -qx 'rmcp v.*' core-tree.txt; then
             echo "::error::compact-mcp-core must not depend on rmcp"; exit 1
           fi
 

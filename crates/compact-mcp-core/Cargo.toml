@@ -26,3 +26,8 @@ uuid.workspace = true
 insta.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
+
+[features]
+# Declared empty from Task 1 so CI's `toolchain` job (`--features toolchain-tests`)
+# resolves. Task 7 puts the real subprocess tests behind it.
+toolchain-tests = []
