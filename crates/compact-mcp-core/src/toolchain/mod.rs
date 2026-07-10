@@ -1,3 +1,4 @@
+pub mod compile;
 pub mod fmt;
 pub mod parse_diag;
 pub mod proc;
@@ -30,6 +31,14 @@ impl Toolchain {
             bin: bin.into(),
             compiler_version,
         }
+    }
+
+    pub(crate) fn bin(&self) -> &str {
+        &self.bin
+    }
+
+    pub(crate) fn compiler_version(&self) -> Option<&str> {
+        self.compiler_version.as_deref()
     }
 
     pub(crate) async fn run(&self, args: &[&str]) -> Result<Output, CoreError> {

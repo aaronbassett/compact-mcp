@@ -1,0 +1,8 @@
+pragma language_version >= 0.23;
+import CompactStandardLibrary;
+
+export ledger round: Counter;
+
+export circuit bad(): Field {
+  return undefined_thing;
+}

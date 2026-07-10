@@ -490,6 +490,101 @@ async fn fixup_tool_returns_result_without_touching_the_file() {
 }
 
 #[tokio::test]
+async fn compile_tool_surfaces_a_missing_toolchain_as_an_is_error_result() {
+    // Hermetic: no real toolchain needed. `compile` does not parse-gate like
+    // `format`/`fixup` — it goes straight to spawning the subprocess, so a
+    // bogus binary fails fast with `ToolchainNotFound` before any compilation
+    // is attempted. That `CoreError` must surface as a successful call with
+    // `isError: true` carrying the message, never as an opaque protocol error.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        "tests/fixtures/counter.compact",
+        dir.path().join("c.compact"),
+    )
+    .unwrap();
+    let ws = compact_mcp_core::Workspace::new(dir.path()).unwrap();
+    let tc = compact_mcp_core::Toolchain::new("compact-does-not-exist-xyz", None);
+
+    let (client_t, server_t) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        let _ = compact_mcp::server::CompactMcp::with_toolchain(ws, tc)
+            .serve(server_t)
+            .await
+            .expect("server failed to start")
+            .waiting()
+            .await;
+    });
+    let client = ().serve(client_t).await.unwrap();
+
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("compile").with_arguments(
+                serde_json::json!({ "path": "c.compact" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.is_error,
+        Some(true),
+        "missing toolchain must be an is_error result: {:?}",
+        res.content
+    );
+    let text = format!("{:?}", res.content);
+    assert!(
+        text.contains("not found"),
+        "error result must carry the not-found message: {text}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg_attr(not(feature = "toolchain-tests"), ignore)]
+async fn a_failing_compile_returns_diagnostics_not_a_protocol_error() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        "tests/fixtures/broken.compact",
+        dir.path().join("b.compact"),
+    )
+    .unwrap();
+    let ws = compact_mcp_core::Workspace::new(dir.path()).unwrap();
+
+    let (client_t, server_t) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        let _ = compact_mcp::server::CompactMcp::new(ws)
+            .serve(server_t)
+            .await
+            .expect("server failed to start")
+            .waiting()
+            .await;
+    });
+    let client = ().serve(client_t).await.unwrap();
+
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("compile").with_arguments(
+                serde_json::json!({ "path": "b.compact" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("the CALL succeeds; the CONTRACT fails");
+
+    assert_eq!(res.is_error, Some(true));
+    let text = format!("{:?}", res.content);
+    assert!(text.contains("unbound identifier"), "{text}");
+    assert!(text.contains("compactc"), "must be source-tagged: {text}");
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
 #[cfg_attr(not(feature = "toolchain-tests"), ignore)]
 async fn versions_tool_reports_both_parsers_and_a_skew_verdict() {
     let dir = tempfile::tempdir().unwrap();

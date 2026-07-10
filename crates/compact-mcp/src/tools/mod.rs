@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod compile;
 pub mod fmt;
 pub mod toolchain;
 
