@@ -6,6 +6,7 @@ pub mod error;
 pub mod toolchain;
 pub mod workspace;
 
+pub use analyze::MAX_SOURCE_BYTES;
 pub use diagnostic::{Diagnostic, Position, Severity, Source, Span};
 pub use error::CoreError;
 pub use toolchain::Toolchain;

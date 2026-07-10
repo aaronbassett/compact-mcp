@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use compactp_parser::ParseOptions;
 use compactp_syntax::{SyntaxKind, SyntaxNode};
 use serde::Serialize;
 
@@ -7,6 +8,19 @@ use crate::Diagnostic;
 
 pub mod symbols;
 pub use symbols::{Symbol, SymbolKind, ast_json, symbols};
+
+/// Largest source we will parse or read, in bytes (2 MiB). Real Compact contracts are far
+/// smaller; this bounds absolute work and memory for a single tool call.
+pub const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Parser options we use everywhere. `max_depth` is pinned explicitly (not left to the
+/// upstream default) so a future `compactp` change cannot silently remove our recursion bound.
+fn parse_opts() -> ParseOptions {
+    ParseOptions {
+        max_depth: 256,
+        ..ParseOptions::default()
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ParseOutcome {
@@ -28,12 +42,12 @@ pub struct Stats {
 }
 
 pub(crate) fn parse_root(source: &str) -> (SyntaxNode, Vec<compactp_diagnostics::Diagnostic>) {
-    let result = compactp_parser::parse(source);
+    let result = compactp_parser::parse_with(source, parse_opts());
     (SyntaxNode::new_root(result.green), result.errors)
 }
 
 pub fn diagnostics(source: &str, file: &str, max: Option<usize>) -> ParseOutcome {
-    let result = compactp_parser::parse(source);
+    let result = compactp_parser::parse_with(source, parse_opts());
     let error_count = result.errors.len();
 
     let take = max.unwrap_or(usize::MAX);
@@ -58,7 +72,7 @@ pub fn stats(source: &str) -> Stats {
     let token_count = compactp_lexer::lex(source).len();
 
     let start = Instant::now();
-    let result = compactp_parser::parse(source);
+    let result = compactp_parser::parse_with(source, parse_opts());
     let parse_time = start.elapsed();
 
     let root = SyntaxNode::new_root(result.green);
@@ -76,8 +90,16 @@ pub fn stats(source: &str) -> Stats {
     }
 }
 
-fn count_nodes(node: &SyntaxNode) -> usize {
-    1 + node.children().map(|c| count_nodes(&c)).sum::<usize>()
+/// Total node count. Iterative (explicit stack) so a pathologically deep tree cannot
+/// overflow the call stack, independent of the parser's own depth guard.
+fn count_nodes(root: &SyntaxNode) -> usize {
+    let mut count = 0usize;
+    let mut stack = vec![root.clone()];
+    while let Some(node) = stack.pop() {
+        count += 1;
+        stack.extend(node.children());
+    }
+    count
 }
 
 #[cfg(test)]
@@ -127,5 +149,22 @@ mod tests {
         assert!(s.node_count > 0);
         assert_eq!(s.error_count, 0);
         assert_eq!(s.recovery_count, 0);
+    }
+
+    #[test]
+    fn count_nodes_is_iterative_and_bounded_on_deep_input() {
+        // Deeply-nested input: the parser's max_depth guard keeps the tree shallow, and
+        // count_nodes is iterative regardless — this must return, not overflow.
+        let deep = format!(
+            "circuit c(): [] {{ x := {}1{}; }}",
+            "(".repeat(40_000),
+            ")".repeat(40_000)
+        );
+        let s = stats(&deep);
+        assert!(s.node_count > 0);
+        assert!(
+            s.error_count > 0,
+            "over-deep input should report recovery errors"
+        );
     }
 }
