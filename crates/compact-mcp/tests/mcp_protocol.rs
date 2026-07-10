@@ -301,6 +301,195 @@ async fn format_tool_surfaces_a_missing_toolchain_as_an_is_error_result() {
 }
 
 #[tokio::test]
+async fn format_tool_flags_a_parse_failure_as_is_error() {
+    // Hermetic: the CORE parse gate runs BEFORE any `compact` subprocess is
+    // spawned, so broken source returns `Ok(FormatOutcome { ok: false, .. })`
+    // carrying compactp diagnostics without ever invoking the formatter. This
+    // must therefore pass WITHOUT `--features toolchain-tests`. The tool maps
+    // `ok: false` to `isError: true`.
+    let dir = tempfile::tempdir().unwrap();
+    let ws = compact_mcp_core::Workspace::new(dir.path()).unwrap();
+
+    let (client_t, server_t) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        let _ = compact_mcp::server::CompactMcp::new(ws)
+            .serve(server_t)
+            .await
+            .expect("server failed to start")
+            .waiting()
+            .await;
+    });
+    let client = ().serve(client_t).await.unwrap();
+
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("format").with_arguments(
+                serde_json::json!({ "source": "export circuit oops(): [] { let x = }" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.is_error,
+        Some(true),
+        "a parse failure must be an is_error result: {:?}",
+        res.content
+    );
+    let text = format!("{:?}", res.content);
+    assert!(
+        text.contains("diagnostics") && text.contains("compactp"),
+        "parse-failure result must carry source-tagged diagnostics: {text}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg_attr(not(feature = "toolchain-tests"), ignore)]
+async fn format_tool_write_true_rewrites_the_file() {
+    // Locks the one mutating code path at the tool boundary: `write: true` must
+    // rewrite the file in place through the `format` handler.
+    let dir = tempfile::tempdir().unwrap();
+    let messy = "pragma language_version >= 0.23;\nimport CompactStandardLibrary;\nexport ledger    a:Counter;\n";
+    std::fs::write(dir.path().join("m.compact"), messy).unwrap();
+    let ws = compact_mcp_core::Workspace::new(dir.path()).unwrap();
+
+    let (client_t, server_t) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        let _ = compact_mcp::server::CompactMcp::new(ws)
+            .serve(server_t)
+            .await
+            .expect("server failed to start")
+            .waiting()
+            .await;
+    });
+    let client = ().serve(client_t).await.unwrap();
+
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("format").with_arguments(
+                serde_json::json!({ "path": "m.compact", "write": true })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_ne!(res.is_error, Some(true));
+
+    let on_disk = std::fs::read_to_string(dir.path().join("m.compact")).unwrap();
+    assert!(
+        on_disk.contains("export ledger a: Counter;"),
+        "write:true must rewrite the file to canonical form; got {on_disk:?}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn fixup_tool_surfaces_a_missing_toolchain_as_an_is_error_result() {
+    // Hermetic mirror of the format missing-toolchain test, for the OTHER tool in
+    // the pair — the one that mutates on `write: true`. A VALID contract sails
+    // through the core parse gate and reaches `Toolchain::run`, where the bogus
+    // binary fails fast with `ToolchainNotFound`. The `fixup` handler's
+    // `Err(CoreError)` arm must surface it as `isError: true` carrying the
+    // message, proving the tool name and error mapping are wired.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("x.compact"),
+        "pragma language_version >= 0.23;\n",
+    )
+    .unwrap();
+    let ws = compact_mcp_core::Workspace::new(dir.path()).unwrap();
+    let tc = compact_mcp_core::Toolchain::new("compact-does-not-exist-xyz", None);
+
+    let (client_t, server_t) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        let _ = compact_mcp::server::CompactMcp::with_toolchain(ws, tc)
+            .serve(server_t)
+            .await
+            .expect("server failed to start")
+            .waiting()
+            .await;
+    });
+    let client = ().serve(client_t).await.unwrap();
+
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("fixup").with_arguments(
+                serde_json::json!({ "path": "x.compact" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.is_error,
+        Some(true),
+        "missing toolchain must be an is_error result: {:?}",
+        res.content
+    );
+    let text = format!("{:?}", res.content);
+    assert!(
+        text.contains("not found"),
+        "error result must carry the not-found message: {text}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg_attr(not(feature = "toolchain-tests"), ignore)]
+async fn fixup_tool_returns_result_without_touching_the_file() {
+    // `fixup` with write defaulting to false is a no-op on already-canonical
+    // input and must never mutate disk. Confirms the `fixup` tool name, the
+    // `FixupArgs.path` deserialization, and the non-destructive default all wire
+    // through the protocol layer.
+    let dir = tempfile::tempdir().unwrap();
+    let clean = "pragma language_version >= 0.23;\n\nimport CompactStandardLibrary;\n\nexport ledger a: Counter;\n";
+    std::fs::write(dir.path().join("m.compact"), clean).unwrap();
+    let ws = compact_mcp_core::Workspace::new(dir.path()).unwrap();
+
+    let (client_t, server_t) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        let _ = compact_mcp::server::CompactMcp::new(ws)
+            .serve(server_t)
+            .await
+            .expect("server failed to start")
+            .waiting()
+            .await;
+    });
+    let client = ().serve(client_t).await.unwrap();
+
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("fixup").with_arguments(
+                serde_json::json!({ "path": "m.compact" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_ne!(res.is_error, Some(true));
+
+    let on_disk = std::fs::read_to_string(dir.path().join("m.compact")).unwrap();
+    assert_eq!(
+        on_disk, clean,
+        "write defaults to false; fixup must leave the file byte-identical"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
 #[cfg_attr(not(feature = "toolchain-tests"), ignore)]
 async fn versions_tool_reports_both_parsers_and_a_skew_verdict() {
     let dir = tempfile::tempdir().unwrap();

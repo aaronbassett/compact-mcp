@@ -73,7 +73,8 @@ impl CompactMcp {
 
     #[tool(
         description = "Apply Compact fixup transformations. Returns the fixed text by \
-                          default; pass write:true to rewrite in place."
+                          default; pass write:true to rewrite in place. \
+                          If the source does not parse, returns parse diagnostics instead."
     )]
     async fn fixup(
         &self,
