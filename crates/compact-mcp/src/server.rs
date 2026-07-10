@@ -1,15 +1,33 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use compact_mcp_core::jobs::{BuildGate, TaskStore};
 use compact_mcp_core::{Toolchain, Workspace};
 use rmcp::{
-    ErrorData as McpError, ServerHandler,
+    ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::router::tool::ToolRouter,
-    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo},
+    model::{
+        CallToolRequestParams, CallToolResult, CancelTaskParams, CancelTaskResult, ContentBlock,
+        CreateTaskResult, GetTaskParams, GetTaskPayloadParams, GetTaskPayloadResult, GetTaskResult,
+        Implementation, ListTasksResult, PaginatedRequestParams, ServerCapabilities, ServerInfo,
+    },
+    service::RequestContext,
     tool_handler,
 };
+
+tokio::task_local! {
+    pub(crate) static TASK_CANCEL: tokio_util::sync::CancellationToken;
+}
 
 #[derive(Clone)]
 pub struct CompactMcp {
     pub(crate) workspace: Workspace,
     pub(crate) toolchain: Toolchain,
+    pub(crate) tasks: Arc<TaskStore>,
+    pub(crate) gate: Arc<BuildGate>,
+    pub(crate) compile_timeout_secs: u64,
+    /// stdio: true. HTTP: false — we cannot identify requestors.
+    pub(crate) advertise_task_list: bool,
     tool_router: ToolRouter<CompactMcp>,
 }
 
@@ -22,12 +40,42 @@ impl CompactMcp {
         Self {
             workspace,
             toolchain,
+            tasks: Arc::new(TaskStore::new(
+                Duration::from_secs(900),
+                Duration::from_secs(3600),
+            )),
+            gate: Arc::new(BuildGate::new(1, 8)),
+            compile_timeout_secs: 900,
+            advertise_task_list: true,
             tool_router: Self::analysis_router()
                 + Self::toolchain_router()
                 + Self::fmt_router()
                 + Self::compile_router()
                 + Self::artifacts_router(),
         }
+    }
+
+    /// Apply the CLI config. Called from `main`.
+    pub fn with_config(mut self, c: &crate::config::Config) -> Self {
+        self.tasks = Arc::new(TaskStore::new(
+            Duration::from_secs(c.default_task_ttl),
+            Duration::from_secs(c.max_task_ttl),
+        ));
+        self.gate = Arc::new(BuildGate::new(c.max_concurrent_builds, c.max_queued_builds));
+        self.compile_timeout_secs = c.compile_timeout;
+        self
+    }
+
+    /// The task's cancel token when running inside `enqueue_task`'s scope, else a
+    /// fresh (never-cancelled) token for a plain synchronous tool call.
+    pub(crate) fn current_cancel_token(&self) -> tokio_util::sync::CancellationToken {
+        TASK_CANCEL.try_with(|t| t.clone()).unwrap_or_default()
+    }
+
+    /// The shared task registry, for wiring up the retention GC loop from
+    /// `main` (a separate binary crate, so the field itself stays `pub(crate)`).
+    pub fn tasks(&self) -> Arc<TaskStore> {
+        self.tasks.clone()
     }
 
     /// Resolve a `path`-or-`source` argument into `(source_text, file_label)`.
@@ -111,7 +159,16 @@ impl ServerHandler for CompactMcp {
         // invocation site* — inside the `rmcp` crate itself, not ours. Using
         // it here would report `rmcp`/`2.2.0` instead of this binary's
         // identity, so build `Implementation` from our own crate's env vars.
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        let mut caps = ServerCapabilities::builder().enable_tools().build();
+        let mut tasks = rmcp::model::TasksCapability::server_default();
+        // HTTP cannot identify requestors, so `tasks/list` (which has no
+        // per-caller scoping) is withheld on that transport; stdio's single
+        // trusted client keeps it.
+        if !self.advertise_task_list {
+            tasks.list = None;
+        }
+        caps.tasks = Some(tasks);
+        ServerInfo::new(caps)
             .with_server_info(Implementation::new(
                 env!("CARGO_PKG_NAME"),
                 env!("CARGO_PKG_VERSION"),
@@ -123,6 +180,46 @@ impl ServerHandler for CompactMcp {
                  tool spoke."
                     .to_string(),
             )
+    }
+
+    async fn enqueue_task(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CreateTaskResult, McpError> {
+        self.enqueue_task_impl(request, context).await
+    }
+
+    async fn get_task_info(
+        &self,
+        request: GetTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, McpError> {
+        self.get_task_info_impl(request).await
+    }
+
+    async fn get_task_result(
+        &self,
+        request: GetTaskPayloadParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskPayloadResult, McpError> {
+        self.get_task_result_impl(request).await
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CancelTaskResult, McpError> {
+        self.cancel_task_impl(request).await
+    }
+
+    async fn list_tasks(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListTasksResult, McpError> {
+        self.list_tasks_impl(request).await
     }
 }
 

@@ -9,6 +9,7 @@ rust-version.workspace = true
 compact-mcp-core.workspace = true
 anyhow.workspace = true
 axum.workspace = true
+chrono.workspace = true
 clap.workspace = true
 rmcp.workspace = true
 semver.workspace = true
@@ -25,3 +26,4 @@ tempfile.workspace = true
 
 [features]
 toolchain-tests = ["compact-mcp-core/toolchain-tests"]
+testing = []

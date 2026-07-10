@@ -6,7 +6,6 @@ use rmcp::{
     ErrorData as McpError, handler::server::wrapper::Parameters, model::CallToolResult, schemars,
     tool, tool_router,
 };
-use tokio_util::sync::CancellationToken;
 
 use crate::server::CompactMcp;
 use crate::tools::SourceInput;
@@ -39,7 +38,8 @@ impl CompactMcp {
                        no proving keys). Set skip_zk:false to generate PLONK proving keys — \
                        cost scales with circuit size; strongly prefer invoking as a task. \
                        compactc reports only the FIRST error and stops; use `diagnostics` \
-                       to see every syntax error at once."
+                       to see every syntax error at once.",
+        execution(task_support = "optional")
     )]
     async fn compile(
         &self,
@@ -103,9 +103,18 @@ impl CompactMcp {
             source_root: args.source_root.clone(),
         };
 
+        // Serialize builds through the gate; a full queue is a CoreError the
+        // handler surfaces as isError (never an opaque McpError). Hold the permit
+        // for the whole compile. Use the task cancel token when running as a task
+        // (a fresh, never-cancelled token otherwise) and the configured timeout.
+        let _permit = self.gate.acquire().await?;
         let out = self
             .toolchain
-            .compile(&req, CancellationToken::new(), Duration::from_secs(900))
+            .compile(
+                &req,
+                self.current_cancel_token(),
+                Duration::from_secs(self.compile_timeout_secs),
+            )
             .await?;
 
         Ok((out, target_dir))
