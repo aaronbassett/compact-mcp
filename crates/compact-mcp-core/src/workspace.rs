@@ -31,34 +31,47 @@ impl Workspace {
             self.root.join(p)
         };
 
-        // Walk up to the nearest existing ancestor, canonicalize it, then
-        // re-append the tail. `canonicalize` fails on non-existent paths.
+        // Walk up to the nearest existing ancestor and canonicalize it
+        // (resolving symlinks). `canonicalize` fails on non-existent paths, so
+        // we peel components off the end and retry until something exists.
+        // Use `components().next_back()` rather than `file_name()`: the latter
+        // returns `None` for a trailing `..`, which would silently drop the
+        // component and let a traversal collapse into an unrelated in-root path.
         let mut existing = joined.as_path();
-        let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+        let mut tail = Vec::new();
         let canonical_base = loop {
             match std::fs::canonicalize(existing) {
                 Ok(c) => break c,
-                Err(_) => match existing.parent() {
-                    Some(parent) => {
-                        if let Some(name) = existing.file_name() {
-                            tail.push(name);
-                        }
+                Err(_) => match (existing.components().next_back(), existing.parent()) {
+                    (Some(last), Some(parent)) => {
+                        tail.push(last);
                         existing = parent;
                     }
-                    None => return Err(CoreError::PathEscape(joined)),
+                    _ => return Err(CoreError::PathEscape(joined)),
                 },
             }
         };
 
+        // Re-append the non-existent tail, resolving `.`/`..` lexically against
+        // the canonical base. A `..` that pops above the base escapes the root.
         let mut out = canonical_base;
-        for name in tail.into_iter().rev() {
-            out.push(name);
+        for component in tail.into_iter().rev() {
+            match component {
+                Component::Normal(name) => out.push(name),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if !out.pop() {
+                        return Err(CoreError::PathEscape(joined));
+                    }
+                }
+                // A root or prefix can only be the first canonicalized
+                // component, never part of the non-existent tail.
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err(CoreError::PathEscape(joined));
+                }
+            }
         }
 
-        // Reject `..` that survived (only possible in the non-existent tail).
-        if out.components().any(|c| matches!(c, Component::ParentDir)) {
-            return Err(CoreError::PathEscape(out));
-        }
         if !out.starts_with(&self.root) {
             return Err(CoreError::PathEscape(out));
         }
@@ -67,13 +80,30 @@ impl Workspace {
 
     /// A uniquely-named directory under the root, removed on drop.
     pub fn temp_scope(&self, prefix: &str) -> Result<TempScope, CoreError> {
-        let dir = self.root.join(format!(
-            ".compact-mcp-tmp/{prefix}-{}",
-            uuid::Uuid::new_v4()
-        ));
+        // The prefix is joined onto a trusted base, so it must not traverse.
+        // `../../x` would otherwise place the scratch dir (and its later
+        // `remove_dir_all`) above the root.
+        if !is_single_normal_component(prefix) {
+            return Err(CoreError::InvalidArgs(format!(
+                "bad temp scope prefix: {prefix}"
+            )));
+        }
+        let dir = self
+            .root
+            .join(".compact-mcp-tmp")
+            .join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         Ok(TempScope { dir })
     }
+}
+
+/// Returns `true` if `name` is exactly one normal path component: no
+/// separators, no `.` or `..`, not empty, not absolute, and (on Windows) no
+/// drive-relative prefix such as `C:`. Such names can be joined onto a trusted
+/// base without escaping or redirecting it.
+fn is_single_normal_component(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
 }
 
 /// A scratch directory inside the workspace root. Removed on drop.
@@ -88,7 +118,10 @@ impl TempScope {
     }
 
     pub fn write_file(&self, name: &str, contents: &str) -> Result<PathBuf, CoreError> {
-        if name.contains('/') || name.contains('\\') || name == ".." {
+        // A single `Component::Normal` check subsumes separators, `.`, `..`,
+        // the empty name, absolute paths, and Windows drive prefixes like `C:`,
+        // any of which would let `join` escape or replace the scope directory.
+        if !is_single_normal_component(name) {
             return Err(CoreError::InvalidArgs(format!(
                 "bad temp file name: {name}"
             )));
@@ -101,7 +134,13 @@ impl TempScope {
 
 impl Drop for TempScope {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if let Err(error) = std::fs::remove_dir_all(&self.dir) {
+            tracing::warn!(
+                path = %self.dir.display(),
+                %error,
+                "failed to remove temp scope directory on drop"
+            );
+        }
     }
 }
 
@@ -174,10 +213,58 @@ mod tests {
         assert!(!path.exists(), "TempScope must clean up on drop");
     }
 
+    #[test]
+    fn temp_scope_rejects_a_traversing_prefix() {
+        // A prefix must be a single path component. `../../x` would place the
+        // scratch directory (and its later `remove_dir_all`) above the root.
+        let (_d, w) = ws();
+        assert!(matches!(
+            w.temp_scope("../../x"),
+            Err(CoreError::InvalidArgs(_))
+        ));
+    }
+
+    #[test]
+    fn write_file_rejects_non_component_names() {
+        // Anything that is not exactly one normal component is rejected:
+        // separators, traversal, current-dir, and the empty name all escape or
+        // redirect the join.
+        let (_d, w) = ws();
+        let scope = w.temp_scope("probe").unwrap();
+        for bad in ["../escape", "a/b", "..", ".", ""] {
+            assert!(
+                matches!(scope.write_file(bad, "x"), Err(CoreError::InvalidArgs(_))),
+                "should reject name {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dotdot_that_escapes_via_a_nonexistent_prefix_is_rejected() {
+        // `build` does not exist, so the whole tail is lexical. The `..`
+        // segments must be resolved (not silently dropped) so the escape is
+        // caught instead of collapsing to `<root>/build/evil`.
+        let (_d, w) = ws();
+        assert!(matches!(
+            w.resolve("build/../../evil"),
+            Err(CoreError::PathEscape(_))
+        ));
+    }
+
+    #[test]
+    fn dotdot_within_the_root_resolves_lexically() {
+        // A `..` that stays inside the root must resolve to the correct target,
+        // not be dropped: `build/../out` is `<root>/out`.
+        let (_d, w) = ws();
+        let p = w.resolve("build/../out").unwrap();
+        assert_eq!(p, w.root().join("out"));
+        assert!(p.starts_with(w.root()));
+    }
+
     proptest::proptest! {
         #[test]
         fn resolve_never_escapes_the_root(segments in proptest::collection::vec(
-            proptest::string::string_regex("[a-zA-Z0-9._/-]{0,8}").unwrap(), 0..6
+            proptest::string::string_regex("[a-b./]{0,8}").unwrap(), 0..6
         )) {
             let d = tempfile::tempdir().unwrap();
             let w = Workspace::new(d.path()).unwrap();
