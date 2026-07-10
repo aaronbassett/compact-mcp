@@ -1,4 +1,4 @@
-use compact_mcp_core::Workspace;
+use compact_mcp_core::{Toolchain, Workspace};
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::router::tool::ToolRouter,
@@ -9,14 +9,20 @@ use rmcp::{
 #[derive(Clone)]
 pub struct CompactMcp {
     pub(crate) workspace: Workspace,
+    pub(crate) toolchain: Toolchain,
     tool_router: ToolRouter<CompactMcp>,
 }
 
 impl CompactMcp {
     pub fn new(workspace: Workspace) -> Self {
+        Self::with_toolchain(workspace, Toolchain::new("compact", None))
+    }
+
+    pub fn with_toolchain(workspace: Workspace, toolchain: Toolchain) -> Self {
         Self {
             workspace,
-            tool_router: Self::analysis_router(),
+            toolchain,
+            tool_router: Self::analysis_router() + Self::toolchain_router(),
         }
     }
 

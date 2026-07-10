@@ -21,3 +21,6 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 rmcp = { workspace = true, features = ["client"] }
 tempfile.workspace = true
+
+[features]
+toolchain-tests = ["compact-mcp-core/toolchain-tests"]

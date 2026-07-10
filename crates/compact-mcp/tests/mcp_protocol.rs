@@ -165,3 +165,31 @@ async fn ast_symbols_and_stats_flag_over_depth_refusal() {
 
     client.cancel().await.unwrap();
 }
+
+#[tokio::test]
+#[cfg_attr(not(feature = "toolchain-tests"), ignore)]
+async fn versions_tool_reports_both_parsers_and_a_skew_verdict() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = compact_mcp_core::Workspace::new(dir.path()).unwrap();
+    let (client_t, server_t) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        let _ = compact_mcp::server::CompactMcp::new(ws)
+            .serve(server_t)
+            .await
+            .expect("server failed to start")
+            .waiting()
+            .await;
+    });
+    let client = ().serve(client_t).await.unwrap();
+
+    let res = client
+        .call_tool(rmcp::model::CallToolRequestParams::new("versions"))
+        .await
+        .unwrap();
+    assert_ne!(res.is_error, Some(true));
+    let text = format!("{:?}", res.content);
+    for key in ["compiler", "language", "compactp", "skew"] {
+        assert!(text.contains(key), "versions output missing {key}: {text}");
+    }
+    client.cancel().await.unwrap();
+}

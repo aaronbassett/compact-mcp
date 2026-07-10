@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod toolchain;
 
 use rmcp::schemars;
 

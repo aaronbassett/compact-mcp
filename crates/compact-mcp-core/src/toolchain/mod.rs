@@ -88,6 +88,18 @@ impl Toolchain {
     }
 }
 
+impl Toolchain {
+    pub async fn list(&self) -> Result<String, CoreError> {
+        let out = self.run(&["list"]).await?;
+        Ok(out.stdout)
+    }
+
+    pub async fn check(&self) -> Result<String, CoreError> {
+        let out = self.run(&["check"]).await?;
+        Ok(format!("{}{}", out.stdout, out.stderr))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
