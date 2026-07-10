@@ -1,0 +1,34 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90
+        with: { components: rustfmt, clippy }
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - name: core must not depend on rmcp
+        run: |
+          if cargo tree -p compact-mcp-core --prefix none | grep -qx 'rmcp v.*'; then
+            echo "::error::compact-mcp-core must not depend on rmcp"; exit 1
+          fi
+
+  toolchain:
+    # Tests that shell out to a real `compact`. Kept separate so the fast job
+    # above stays hermetic.
+    runs-on: ubuntu-latest
+    env:
+      COMPACT_VERSION: "0.31.1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90
+      - name: install the compact CLI
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf https://github.com/midnightntwrk/compact/releases/latest/download/compact-installer.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: install a pinned compiler
+        run: compact update "$COMPACT_VERSION"
+      - run: cargo test --workspace --features toolchain-tests

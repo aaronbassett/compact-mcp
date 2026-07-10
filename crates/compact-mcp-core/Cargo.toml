@@ -1,0 +1,28 @@
+[package]
+name = "compact-mcp-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+compactp_parser.workspace = true
+compactp_ast.workspace = true
+compactp_lexer.workspace = true
+compactp_syntax.workspace = true
+compactp_diagnostics.workspace = true
+libc.workspace = true
+regex.workspace = true
+semver.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+proptest.workspace = true
+tempfile.workspace = true

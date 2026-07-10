@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = ["crates/compact-mcp-core"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+rust-version = "1.90"
+authors = ["Aaron Bassett"]
+repository = "https://github.com/devrelaicom/compact-mcp"
+
+[workspace.dependencies]
+compact-mcp-core = { path = "crates/compact-mcp-core" }
+
+compactp_parser      = "=0.1.0-beta.1"
+compactp_ast         = "=0.1.0-beta.1"
+compactp_lexer       = "=0.1.0-beta.1"
+compactp_syntax      = "=0.1.0-beta.1"
+compactp_diagnostics = "=0.1.0-beta.1"
+
+rmcp = { version = "2.2.0", features = [
+  "server", "macros", "transport-io", "transport-streamable-http-server",
+] }
+
+anyhow     = "1"
+axum       = "0.8"
+clap       = { version = "4.6", features = ["derive", "env"] }
+libc       = "0.2"
+regex      = "1"
+semver     = "1"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror  = "2"
+tokio      = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tracing    = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid       = { version = "1", features = ["v4"] }
+
+insta    = "1.46"
+proptest = "1"
+tempfile = "3"
