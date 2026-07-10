@@ -5,6 +5,9 @@ use serde::Serialize;
 
 use crate::Diagnostic;
 
+pub mod symbols;
+pub use symbols::{Symbol, SymbolKind, ast_json, symbols};
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ParseOutcome {
     pub success: bool,
@@ -24,7 +27,6 @@ pub struct Stats {
     pub parse_time_ms: f64,
 }
 
-#[allow(dead_code)]
 pub(crate) fn parse_root(source: &str) -> (SyntaxNode, Vec<compactp_diagnostics::Diagnostic>) {
     let result = compactp_parser::parse(source);
     (SyntaxNode::new_root(result.green), result.errors)
