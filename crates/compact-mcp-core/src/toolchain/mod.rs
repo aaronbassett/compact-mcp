@@ -1,4 +1,5 @@
 pub mod fmt;
+pub mod parse_diag;
 pub mod proc;
 pub mod versions;
 
