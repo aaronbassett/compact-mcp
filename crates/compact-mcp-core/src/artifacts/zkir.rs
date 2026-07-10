@@ -24,6 +24,9 @@ pub struct Zkir {
     pub version: ZkirVersion,
     pub do_communications_commitment: bool,
     pub num_inputs: u64,
+    /// Intentionally NOT `#[serde(default)]`: a real `.zkir` always emits this
+    /// key (and the file only exists for a `proof: true` circuit), so an absent
+    /// `instructions` means a corrupt/wrong file and should fail loudly.
     pub instructions: Vec<Instruction>,
 }
 
@@ -102,6 +105,23 @@ mod tests {
         assert_eq!(z.instructions[0].op, "load_imm");
         assert_eq!(z.instructions[0].rest["imm"], "01");
         assert!(z.do_communications_commitment);
+    }
+
+    #[test]
+    fn no_operand_op_has_empty_rest_and_null_operand_is_preserved() {
+        // Live-observed shapes: `{"op":"add"}` (no operands) and
+        // `{"op":"private_input","guard":null}` (null-valued operand). Flatten
+        // must capture both without leaking `op` into `rest`.
+        let probe = r#"{"version":{"major":2,"minor":0},"do_communications_commitment":true,
+          "num_inputs":0,"instructions":[{"op":"add"},{"op":"private_input","guard":null}]}"#;
+        let z: Zkir = serde_json::from_str(probe).unwrap();
+        assert_eq!(z.instructions[0].op, "add");
+        assert!(z.instructions[0].rest.is_empty());
+        assert_eq!(
+            z.instructions[1].rest.get("guard"),
+            Some(&serde_json::Value::Null)
+        );
+        assert!(!z.instructions[1].rest.contains_key("op"));
     }
 
     #[test]
