@@ -1,3 +1,9 @@
+// The whole suite drives the server through the test-only `testing` client
+// helpers, which only exist under the `testing` feature. Gate the file so a
+// plain `cargo test` (no feature) compiles it to nothing instead of failing on
+// the missing import; run it with `--features testing`.
+#![cfg(feature = "testing")]
+
 use compact_mcp::testing::{
     await_terminal, cancel_task, connect, start_compile_task, task_payload,
 };
