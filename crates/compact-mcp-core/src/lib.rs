@@ -1,5 +1,6 @@
 //! Domain logic for compact-mcp. Contains no MCP protocol knowledge.
 
+pub mod analyze;
 pub mod diagnostic;
 pub mod error;
 pub mod workspace;
