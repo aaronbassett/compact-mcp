@@ -8,7 +8,10 @@ use crate::CoreError;
 pub struct TypeRef {
     #[serde(rename = "type-name")]
     pub type_name: String,
-    /// `Bytes<N>` carries `length`.
+    /// `Bytes<N>` carries `length` (byte width). `Vector<N, T>` ALSO emits a
+    /// `length` key here (the element count — a different meaning); the Vector's
+    /// element type is a singular `type` key the compiler emits that this struct
+    /// does not model, so a Vector round-trips with only its length preserved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub length: Option<u64>,
     /// `Uint<N>` carries `maxval` — the maximum value, NOT the bit width.
@@ -42,7 +45,11 @@ pub struct Circuit {
     pub proof: bool,
     #[serde(default)]
     pub arguments: Vec<Argument>,
-    #[serde(rename = "result-type")]
+    /// Circuits spell this key with a HYPHEN and witnesses with a SPACE. Accept
+    /// both on each struct so an upstream normalisation to one spelling does not
+    /// silently yield a default `TypeRef`. A missing key (either spelling) still
+    /// fails loudly, because this field has no `#[serde(default)]`.
+    #[serde(rename = "result-type", alias = "result type")]
     pub result_type: TypeRef,
 }
 
@@ -88,8 +95,16 @@ pub struct ContractInfo {
 
 impl ContractInfo {
     pub fn load(path: &Path) -> Result<Self, CoreError> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|_| CoreError::ArtifactMissing(path.to_path_buf()))?;
+        // Only a genuine "not found" is an ArtifactMissing; a permission error,
+        // is-a-directory, or non-UTF-8/read failure must surface as Io so the
+        // caller is not misdirected into looking for a file that is actually there.
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                CoreError::ArtifactMissing(path.to_path_buf())
+            } else {
+                CoreError::Io(e)
+            }
+        })?;
         serde_json::from_str(&text).map_err(|e| CoreError::MalformedArtifact {
             path: path.to_path_buf(),
             reason: e.to_string(),
@@ -188,5 +203,108 @@ mod tests {
         let ci: ContractInfo = serde_json::from_str(REAL).unwrap();
         assert_eq!(ci.compiler_version, "0.31.1");
         assert_eq!(ci.language_version, "0.23.0");
+    }
+
+    #[test]
+    fn load_reads_a_valid_file_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contract-info.json");
+        std::fs::write(&path, REAL).unwrap();
+        let ci = ContractInfo::load(&path).unwrap();
+        assert_eq!(ci.compiler_version, "0.31.1");
+        assert_eq!(ci.circuits[0].name, "put");
+    }
+
+    #[test]
+    fn load_missing_file_is_artifact_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.json");
+        let err = ContractInfo::load(&path).unwrap_err();
+        assert!(
+            matches!(err, CoreError::ArtifactMissing(ref p) if *p == path),
+            "expected ArtifactMissing({}), got {err:?}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn load_non_notfound_io_error_is_not_reported_as_missing() {
+        // Reading a directory as a file fails with a kind OTHER than NotFound, so
+        // it must surface as Io — reporting ArtifactMissing here would misdiagnose.
+        let dir = tempfile::tempdir().unwrap();
+        let err = ContractInfo::load(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, CoreError::Io(_)),
+            "expected Io for a non-NotFound read failure, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_malformed_json_is_malformed_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contract-info.json");
+        std::fs::write(&path, "{ this is not valid json").unwrap();
+        let err = ContractInfo::load(&path).unwrap_err();
+        assert!(
+            matches!(err, CoreError::MalformedArtifact { .. }),
+            "expected MalformedArtifact, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn missing_required_result_type_fails_loudly() {
+        // A circuit with no result-type key (either spelling) must be a hard
+        // deserialization error, never a silently-defaulted empty TypeRef.
+        let broken = r#"{
+          "compiler-version": "0.31.1",
+          "language-version": "0.23.0",
+          "runtime-version": "0.16.0",
+          "circuits": [{ "name": "put", "pure": false, "proof": true, "arguments": [] }],
+          "witnesses": [], "contracts": [], "ledger": []
+        }"#;
+        assert!(
+            serde_json::from_str::<ContractInfo>(broken).is_err(),
+            "a circuit missing its result-type must fail to deserialize"
+        );
+    }
+
+    #[test]
+    fn missing_required_version_fails_loudly() {
+        // The version fields have no #[serde(default)]; an absent one is a hard error.
+        let broken = r#"{
+          "language-version": "0.23.0",
+          "runtime-version": "0.16.0",
+          "circuits": [], "witnesses": [], "contracts": [], "ledger": []
+        }"#;
+        assert!(
+            serde_json::from_str::<ContractInfo>(broken).is_err(),
+            "a missing compiler-version must fail to deserialize"
+        );
+    }
+
+    #[test]
+    fn circuit_result_type_accepts_the_space_spelling_too() {
+        // Symmetry with Witness: a circuit spelled with a SPACE still deserializes
+        // via the alias, rather than failing or silently defaulting.
+        let spaced = r#"{
+          "compiler-version": "0.31.1",
+          "language-version": "0.23.0",
+          "runtime-version": "0.16.0",
+          "circuits": [{ "name": "put", "pure": true, "proof": false, "arguments": [],
+            "result type": { "type-name": "Field" } }],
+          "witnesses": [], "contracts": [], "ledger": []
+        }"#;
+        let ci: ContractInfo = serde_json::from_str(spaced).unwrap();
+        assert_eq!(ci.circuits[0].result_type.type_name, "Field");
+    }
+
+    #[test]
+    fn non_empty_tuple_result_maps_to_typescript_tuple() {
+        // Live-verified shape: a non-empty tuple emits a PLURAL `types` array.
+        let t = TypeRef {
+            types: vec![TypeRef::named("Field"), TypeRef::named("Boolean")],
+            ..TypeRef::named("Tuple")
+        };
+        assert_eq!(ts_type(&t), "[bigint, boolean]");
     }
 }
