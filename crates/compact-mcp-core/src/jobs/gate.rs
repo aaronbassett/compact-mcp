@@ -126,8 +126,8 @@ mod tests {
             "cancelling a queued waiter must return its slot"
         );
 
-        // The gate still has room: with the slot freed, a fresh acquire succeeds
-        // rather than rejecting on a leaked-counter QueueFull.
+        // Liveness belt (the counter assertion above is the actual leak check):
+        // with the slot freed, the gate is still usable end-to-end.
         drop(held);
         let _permit = g.acquire().await.unwrap();
     }
