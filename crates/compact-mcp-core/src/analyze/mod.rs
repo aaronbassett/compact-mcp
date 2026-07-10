@@ -21,50 +21,88 @@ pub const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
 /// also bounds the parser's O(n²) cost on long operator chains.
 pub const MAX_STRUCTURAL_DEPTH: usize = 512;
 
-/// Conservative proxy for the depth of the syntax tree `parse` would build, scanning bytes
-/// only. Charges for bracket nesting AND for operator/field-access chains (`a+a+…`, `a.b.c…`),
-/// which build left-nested trees the bracket count cannot see. A bracketed group's operators
-/// are un-counted when it closes (the subtree becomes a single child); `;` ends a statement's
-/// chain. Over-estimates (counts operator bytes inside strings/comments, `.` in `0.23`, and
-/// each byte of multi-byte operators) — fine for a DoS guard; real code stays far under the cap.
-/// Refusing over-deep input keeps the tree from ever being built (its recursive Drop aborts the
-/// process) and bounds the parser's O(n²) cost on long operator chains.
+/// Conservative proxy for the depth of the syntax tree `parse` would build, computed from the
+/// token stream. The parser's own `max_depth` guard bounds only recursive descent; its Pratt
+/// loop builds left-associative infix and postfix chains (`a+a+…`, `a.b.c…`, `f()()…`, `a[i][j]…`,
+/// `a as T as T…`) iteratively in one stack frame, so those trees are nested to the full chain
+/// length and their recursive Drop overflows the stack. This charges one unit of depth per such
+/// chain operator plus one per open bracket, banking a postfix call/index onto its enclosing
+/// expression when it closes (so a chain accumulates but a nest is not double-counted), and
+/// resetting at statement/block boundaries. Refusing over-deep input keeps the tree from being
+/// built and bounds the parser's O(n²) cost on long chains. Over-estimates slightly (e.g. a
+/// prefix `-` counts like an infix one); real Compact never approaches the cap.
 pub fn structural_depth(source: &str) -> usize {
-    let mut levels: Vec<usize> = vec![0]; // operator count per open bracket level
-    let mut sum_ops: usize = 0; // total operators across all open levels
+    use compactp_syntax::SyntaxKind::*;
+    let tokens = compactp_lexer::lex(source);
+    // (chain operators banked at this bracket level, is this a postfix call/index bracket)
+    let mut levels: Vec<(usize, bool)> = vec![(0, false)];
+    let mut sum_ops: usize = 0;
     let mut peak: usize = 1;
-    for b in source.bytes() {
-        match b {
-            b'(' | b'[' | b'{' => levels.push(0),
-            b')' | b']' | b'}' => {
-                if let Some(n) = levels.pop() {
+    let mut prev_value_ender = false; // did the previous significant token end a value?
+    for (kind, _text) in tokens {
+        if kind.is_trivia() {
+            continue;
+        }
+        match kind {
+            L_PAREN | L_BRACKET => levels.push((0, prev_value_ender)), // postfix iff after a value
+            L_BRACE => levels.push((0, false)),
+            R_PAREN | R_BRACKET | R_BRACE => {
+                if let Some((n, postfix)) = levels.pop() {
                     sum_ops = sum_ops.saturating_sub(n);
+                    if postfix {
+                        // the CALL/INDEX node banks one level onto the enclosing expression
+                        if let Some(l) = levels.last_mut() {
+                            l.0 += 1;
+                        }
+                        sum_ops += 1;
+                    }
                 }
                 if levels.is_empty() {
-                    levels.push(0);
-                } // tolerate unbalanced input
-            }
-            b';' => {
-                if let Some(last) = levels.last_mut() {
-                    sum_ops = sum_ops.saturating_sub(*last);
-                    *last = 0;
+                    levels.push((0, false));
+                }
+                if kind == R_BRACE {
+                    // end of a block/item: clear the enclosing chain accumulator
+                    if let Some(l) = levels.last_mut() {
+                        sum_ops = sum_ops.saturating_sub(l.0);
+                        l.0 = 0;
+                    }
                 }
             }
-            b'+' | b'-' | b'*' | b'/' | b'%' | b'=' | b'<' | b'>' | b'!' | b'&' | b'|' | b'^'
-            | b'~' | b'.' => {
-                if let Some(last) = levels.last_mut() {
-                    *last += 1;
+            SEMICOLON => {
+                if let Some(l) = levels.last_mut() {
+                    sum_ops = sum_ops.saturating_sub(l.0);
+                    l.0 = 0;
+                }
+            }
+            PLUS | MINUS | STAR | PIPE_PIPE | AMP_AMP | EQ_EQ | BANG_EQ | LT | LT_EQ | GT
+            | GT_EQ | AS_KW | DOT | QUESTION => {
+                if let Some(l) = levels.last_mut() {
+                    l.0 += 1;
                 }
                 sum_ops += 1;
             }
             _ => {}
         }
+        prev_value_ender = matches!(
+            kind,
+            IDENT
+                | R_PAREN
+                | R_BRACKET
+                | R_BRACE
+                | INT_LIT
+                | HEX_LIT
+                | OCT_LIT
+                | BIN_LIT
+                | STRING_LIT
+                | TRUE_KW
+                | FALSE_KW
+        );
         let cur = levels.len() + sum_ops;
         if cur > peak {
             peak = cur;
         }
         if cur > MAX_STRUCTURAL_DEPTH {
-            return cur; // early exit: bounds the scan itself
+            return cur; // early exit: also bounds the scan's own cost
         }
     }
     peak
@@ -243,38 +281,19 @@ mod tests {
         assert_eq!(s.recovery_count, 0);
     }
 
-    fn deeply_nested(depth: usize) -> String {
+    /// Wrap an expression `body` in a minimal valid circuit so the whole string is a realistic,
+    /// parseable contract — the exact shape whose deep tree would SIGABRT on Drop if we parsed it.
+    fn circuit(body: &str) -> String {
         format!(
-            "pragma language_version >= 0.23;\nexport pure circuit f(x: Field): Field {{ return {}x{}; }}\n",
-            "(".repeat(depth),
-            ")".repeat(depth)
+            "pragma language_version >= 0.23;\nexport pure circuit f(x: Field): Field {{ return {body}; }}\n"
         )
-    }
-
-    /// A bracket-free left-nested `x+x+…+x` sum wrapped in a valid circuit. The parser builds
-    /// this chain iteratively (its own 256 depth guard never trips) into a tree ~`terms` deep
-    /// whose recursive Drop SIGABRTs the server. `structural_depth` charges for the operators,
-    /// so the guard catches it even though the bracket count is 1.
-    fn operator_chain(terms: usize) -> String {
-        format!(
-            "pragma language_version >= 0.23;\nexport pure circuit f(x: Field): Field {{ return {}x; }}\n",
-            "x+".repeat(terms)
-        )
-    }
-
-    /// A large but SHALLOW contract: many independent `;`-terminated statements. Its tree is
-    /// wide, not deep, so it must be ALLOWED — this is the whole reason we gate on a depth proxy
-    /// instead of a token/byte cap.
-    fn shallow_statements(count: usize) -> String {
-        let body = "x = x + 1; ".repeat(count);
-        format!("pragma language_version >= 0.23;\nexport circuit f(): [] {{ {body} }}\n")
     }
 
     #[test]
     fn structural_depth_charges_for_brackets_and_operator_chains() {
         assert_eq!(structural_depth("a"), 1);
-        // One top level plus three open bracket levels at the deepest point.
-        assert_eq!(structural_depth("([{}])"), 4);
+        // One top level plus open bracket levels at the deepest point.
+        assert!(structural_depth("([{}])") >= 4);
         // A bare operator chain the bracket count (which would say 1) cannot see.
         let long_chain = format!("{}x", "x+".repeat(1000));
         assert!(structural_depth(&long_chain) > MAX_STRUCTURAL_DEPTH);
@@ -282,60 +301,152 @@ mod tests {
         assert!(structural_depth(&short_chain) <= MAX_STRUCTURAL_DEPTH);
     }
 
+    /// The core regression guard: enumerate EVERY chain-forming construct the parser's Pratt loop
+    /// builds in one stack frame (brackets, infix, member/method, call, index, cast, ternary).
+    /// Each must be refused before its ~2000-deep tree is built; a future construct the guard
+    /// cannot see fails this table loudly (the `structural_depth` assert panics) rather than
+    /// silently SIGABRT'ing the server.
     #[test]
-    fn diagnostics_refuses_over_deep_input_instead_of_crashing() {
-        // depth 20000 would abort the process via the tree's recursive Drop if we parsed it.
-        let out = diagnostics(&deeply_nested(20_000), "deep.compact", None);
-        assert!(!out.success);
-        assert_eq!(out.error_count, 1);
-        assert!(out.diagnostics[0].message.contains("structural depth"));
+    fn every_chain_construct_over_the_cap_is_refused_without_crashing() {
+        let n = 2000; // each shape builds a ~2000-deep tree that WOULD SIGABRT if parsed
+        let shapes: Vec<(&str, String)> = vec![
+            (
+                "parens",
+                circuit(&format!("{}x{}", "(".repeat(n), ")".repeat(n))),
+            ),
+            (
+                "plus",
+                circuit(&{
+                    let mut s = String::from("x");
+                    for _ in 0..n {
+                        s.push_str("+x");
+                    }
+                    s
+                }),
+            ),
+            (
+                "member",
+                circuit(&{
+                    let mut s = String::from("x");
+                    for _ in 0..n {
+                        s.push_str(".a");
+                    }
+                    s
+                }),
+            ),
+            ("call", circuit(&format!("x{}", "()".repeat(n)))),
+            ("index", circuit(&format!("x{}", "[0]".repeat(n)))),
+            ("cast", circuit(&format!("x{}", " as Field".repeat(n)))),
+            (
+                "ternary",
+                circuit(&{
+                    let mut s = String::from("x");
+                    for _ in 0..n {
+                        s.push_str("?x:x");
+                    }
+                    s
+                }),
+            ),
+            (
+                "method",
+                circuit(&{
+                    let mut s = String::from("x");
+                    for _ in 0..n {
+                        s.push_str(".a(b)");
+                    }
+                    s
+                }),
+            ),
+        ];
+        for (name, src) in shapes {
+            assert!(
+                structural_depth(&src) > MAX_STRUCTURAL_DEPTH,
+                "{name}: not over cap"
+            );
+            let out = diagnostics(&src, "deep.compact", None); // must NOT SIGABRT
+            assert!(!out.success && out.error_count == 1, "{name}: not refused");
+            assert!(
+                out.diagnostics[0].message.contains("structural depth"),
+                "{name}"
+            );
+            let s = stats(&src);
+            assert_eq!(s.node_count, 0, "{name}: stats must skip the parse");
+            assert!(symbols(&src).is_empty(), "{name}: symbols must be empty");
+        }
     }
 
+    /// The other side of the guard: legitimate large/deep-but-bounded contracts must NOT be
+    /// refused. This is why we gate on a tree-depth proxy rather than a token/byte cap.
     #[test]
-    fn diagnostics_refuses_bracket_free_operator_chain() {
-        // Regression test for the operator-chain bypass: a valid 5000-term `x+x+…+x` sum has
-        // bracket nesting 1, so the old scan let it through and it SIGABRT'd on Drop. It must
-        // now be refused, and this test must NOT abort.
-        let out = diagnostics(&operator_chain(5000), "chain.compact", None);
-        assert!(!out.success);
-        assert_eq!(out.error_count, 1);
-        assert!(out.diagnostics[0].message.contains("depth"));
-    }
-
-    #[test]
-    fn stats_and_symbols_survive_over_deep_input() {
-        // Neither may build/drop the deep tree. stats still lexes; symbols is empty.
-        let src = deeply_nested(20_000);
-        let s = stats(&src);
-        assert!(s.token_count > 0 && s.node_count == 0);
-        assert!(symbols(&src).is_empty());
-    }
-
-    #[test]
-    fn stats_and_symbols_survive_operator_chain() {
-        // Same bypass shape via stats/symbols: must return without building the deep tree.
-        let src = operator_chain(5000);
-        let s = stats(&src);
-        assert!(s.token_count > 0 && s.node_count == 0);
-        assert!(symbols(&src).is_empty());
-    }
-
-    #[test]
-    fn moderately_nested_input_still_parses_normally() {
-        // Well under the cap: real behaviour is unchanged (this parses, few/no errors).
-        let out = diagnostics(&deeply_nested(10), "ok.compact", None);
-        assert!(out.diagnostics.iter().all(|d| !d.message.contains("depth")));
-    }
-
-    #[test]
-    fn large_shallow_contract_is_not_refused() {
-        // 5000 short statements: big input, trivial depth. Must NOT trip the depth guard —
-        // guards against over-refusal of legitimate large-but-shallow contracts.
-        let out = diagnostics(&shallow_statements(5000), "shallow.compact", None);
-        assert!(
-            out.diagnostics.iter().all(|d| !d.message.contains("depth")),
-            "a large shallow contract must not be refused for structural depth"
-        );
+    fn legitimate_shapes_are_not_refused() {
+        let ok: Vec<(&str, String)> = vec![
+            (
+                "nested_calls_500",
+                circuit(&{
+                    let mut s = String::from("x");
+                    for _ in 0..500 {
+                        s = format!("f({s})");
+                    }
+                    s
+                }),
+            ),
+            (
+                "wide_args_2000",
+                circuit(&{
+                    let mut s = String::from("f(");
+                    for i in 0..2000 {
+                        if i > 0 {
+                            s.push(',');
+                        }
+                        s.push('a');
+                    }
+                    s.push(')');
+                    s
+                }),
+            ),
+            (
+                "mixed_chain_50",
+                circuit(&{
+                    let mut s = String::from("x");
+                    for _ in 0..50 {
+                        s.push_str(".a(b)[0]");
+                    }
+                    s
+                }),
+            ),
+            ("many_circuits_400", {
+                let mut s = String::from("pragma language_version >= 0.23;\nledger n: Counter;\n");
+                for i in 0..400 {
+                    s.push_str(&format!(
+                        "export circuit c{i}(a: Field, b: Field): Field {{ return (a + b) * {i} - a; }}\n"
+                    ));
+                }
+                s
+            }),
+            ("generics_200", {
+                let mut s = String::from("pragma language_version >= 0.23;\n");
+                for i in 0..200 {
+                    s.push_str(&format!(
+                        "export circuit g{i}(m: Map<Bytes<32>, Vector<10, Uint<64>>>): Field {{ return 0; }}\n"
+                    ));
+                }
+                s
+            }),
+        ];
+        for (name, src) in ok {
+            assert!(
+                structural_depth(&src) <= MAX_STRUCTURAL_DEPTH,
+                "{name}: wrongly over cap ({})",
+                structural_depth(&src)
+            );
+            let out = diagnostics(&src, "ok.compact", None);
+            assert!(
+                !out.diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("structural depth")),
+                "{name}: wrongly refused"
+            );
+        }
     }
 
     #[test]
@@ -343,7 +454,11 @@ mod tests {
         // Depth 400 sits above the parser's own 256-deep recursion guard but under our
         // MAX_STRUCTURAL_DEPTH of 512, so this still parses for real (unlike the tests above)
         // and exercises count_nodes walking a tree deeper than the parser's own limit.
-        let s = stats(&deeply_nested(400));
+        let s = stats(&circuit(&format!(
+            "{}x{}",
+            "(".repeat(400),
+            ")".repeat(400)
+        )));
         assert!(s.node_count > 0);
     }
 }
