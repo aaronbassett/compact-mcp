@@ -16,6 +16,8 @@ use rmcp::{
     service::{NotificationContext, RunningService},
 };
 
+use compact_mcp_core::Toolchain;
+
 use crate::server::CompactMcp;
 
 pub async fn connect(dir: &Path) -> RunningService<RoleClient, ()> {
@@ -23,6 +25,23 @@ pub async fn connect(dir: &Path) -> RunningService<RoleClient, ()> {
     let (client_t, server_t) = tokio::io::duplex(1 << 20);
     tokio::spawn(async move {
         let _ = CompactMcp::new(ws)
+            .serve(server_t)
+            .await
+            .expect("server failed to start")
+            .waiting()
+            .await;
+    });
+    ().serve(client_t).await.unwrap()
+}
+
+/// Serve a `CompactMcp` whose `compact` binary is `bin`. Used to substitute a
+/// stub for the real toolchain (e.g. a script that spawns a grandchild).
+pub async fn connect_with_bin(dir: &Path, bin: &Path) -> RunningService<RoleClient, ()> {
+    let ws = compact_mcp_core::Workspace::new(dir).unwrap();
+    let tc = Toolchain::new(bin.to_string_lossy().into_owned(), None);
+    let (client_t, server_t) = tokio::io::duplex(1 << 20);
+    tokio::spawn(async move {
+        let _ = CompactMcp::with_toolchain(ws, tc)
             .serve(server_t)
             .await
             .expect("server failed to start")
@@ -104,7 +123,13 @@ pub async fn cancel_task(
         )))
         .await
     {
+        // `ServerResult` is `#[serde(untagged)]` and `CancelTaskResult` /
+        // `GetTaskResult` have IDENTICAL wire shapes (both are a flattened `Task`
+        // + optional `_meta`), so a successful `tasks/cancel` response decodes as
+        // whichever variant comes first in the union — `GetTaskResult`. Accept
+        // both; either carries the (now-Cancelled) task.
         Ok(ServerResult::CancelTaskResult(r)) => Ok(r.task.status),
+        Ok(ServerResult::GetTaskResult(r)) => Ok(r.task.status),
         Ok(other) => Err(format!("unexpected: {other:?}")),
         Err(e) => Err(format!("{e:?}")),
     }
