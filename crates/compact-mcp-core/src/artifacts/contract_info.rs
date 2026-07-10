@@ -1,0 +1,192 @@
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+
+use crate::CoreError;
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct TypeRef {
+    #[serde(rename = "type-name")]
+    pub type_name: String,
+    /// `Bytes<N>` carries `length`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length: Option<u64>,
+    /// `Uint<N>` carries `maxval` — the maximum value, NOT the bit width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maxval: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub types: Vec<TypeRef>,
+}
+
+impl TypeRef {
+    pub fn named(n: &str) -> Self {
+        Self {
+            type_name: n.to_string(),
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Argument {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub ty: TypeRef,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Circuit {
+    pub name: String,
+    pub pure: bool,
+    /// A `.zkir` file exists for this circuit **iff** `proof` is true.
+    pub proof: bool,
+    #[serde(default)]
+    pub arguments: Vec<Argument>,
+    #[serde(rename = "result-type")]
+    pub result_type: TypeRef,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Witness {
+    pub name: String,
+    #[serde(default)]
+    pub arguments: Vec<Argument>,
+    /// Upstream spells this key with a SPACE for witnesses, and with a HYPHEN
+    /// for circuits. Accept both so a rename upstream does not silently yield
+    /// a default value.
+    #[serde(rename = "result type", alias = "result-type")]
+    pub result_type: TypeRef,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LedgerField {
+    pub name: String,
+    pub index: u64,
+    pub exported: bool,
+    pub storage: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ContractInfo {
+    #[serde(rename = "compiler-version")]
+    pub compiler_version: String,
+    #[serde(rename = "language-version")]
+    pub language_version: String,
+    #[serde(rename = "runtime-version")]
+    pub runtime_version: String,
+    #[serde(default)]
+    pub circuits: Vec<Circuit>,
+    /// Only witnesses that some circuit actually CALLS appear here. A declared
+    /// but unreferenced witness is absent — compare with the `symbols` tool.
+    #[serde(default)]
+    pub witnesses: Vec<Witness>,
+    #[serde(default)]
+    pub contracts: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub ledger: Vec<LedgerField>,
+}
+
+impl ContractInfo {
+    pub fn load(path: &Path) -> Result<Self, CoreError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|_| CoreError::ArtifactMissing(path.to_path_buf()))?;
+        serde_json::from_str(&text).map_err(|e| CoreError::MalformedArtifact {
+            path: path.to_path_buf(),
+            reason: e.to_string(),
+        })
+    }
+}
+
+/// Compact type -> TypeScript type, as the compiler itself emits in `index.d.ts`.
+/// Verified: `Field`/`Uint<N>` -> `bigint`, `Bytes<N>` -> `Uint8Array`,
+/// `Boolean` -> `boolean`, `[]` -> `[]`.
+pub fn ts_type(t: &TypeRef) -> String {
+    match t.type_name.as_str() {
+        "Field" | "Uint" => "bigint".to_string(),
+        "Boolean" => "boolean".to_string(),
+        "Bytes" => "Uint8Array".to_string(),
+        "Tuple" if t.types.is_empty() => "[]".to_string(),
+        "Tuple" => format!(
+            "[{}]",
+            t.types.iter().map(ts_type).collect::<Vec<_>>().join(", ")
+        ),
+        _ => "unknown".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verbatim output of `compact compile --skip-zk` on a contract with a used
+    /// witness taking `Bytes<32>` and `Uint<16>`. Note the two different spellings
+    /// of the result-type key.
+    const REAL: &str = r#"{
+      "compiler-version": "0.31.1",
+      "language-version": "0.23.0",
+      "runtime-version": "0.16.0",
+      "circuits": [
+        { "name": "put", "pure": false, "proof": true,
+          "arguments": [{ "name": "k", "type": { "type-name": "Bytes", "length": 32 } }],
+          "result-type": { "type-name": "Tuple", "types": [] } }
+      ],
+      "witnesses": [
+        { "name": "lookup",
+          "arguments": [
+            { "name": "key", "type": { "type-name": "Bytes", "length": 32 } },
+            { "name": "idx", "type": { "type-name": "Uint", "maxval": 65535 } }
+          ],
+          "result type": { "type-name": "Field" } },
+        { "name": "flag", "arguments": [], "result type": { "type-name": "Boolean" } }
+      ],
+      "contracts": [],
+      "ledger": [{ "name": "n", "index": 0, "exported": true, "storage": "Counter" }]
+    }"#;
+
+    #[test]
+    fn deserializes_both_result_type_spellings() {
+        let ci: ContractInfo = serde_json::from_str(REAL).unwrap();
+        // circuits use "result-type"; witnesses use "result type" (with a space).
+        assert_eq!(ci.circuits[0].result_type.type_name, "Tuple");
+        assert_eq!(ci.witnesses[0].result_type.type_name, "Field");
+        assert_eq!(ci.witnesses[1].result_type.type_name, "Boolean");
+    }
+
+    #[test]
+    fn captures_bytes_length_and_uint_maxval() {
+        let ci: ContractInfo = serde_json::from_str(REAL).unwrap();
+        let w = &ci.witnesses[0];
+        assert_eq!(w.arguments[0].ty.length, Some(32));
+        assert_eq!(w.arguments[1].ty.maxval, Some(65535));
+        assert_eq!(w.arguments[1].ty.length, None);
+    }
+
+    #[test]
+    fn maps_compact_types_to_typescript() {
+        assert_eq!(ts_type(&TypeRef::named("Field")), "bigint");
+        assert_eq!(ts_type(&TypeRef::named("Boolean")), "boolean");
+        assert_eq!(
+            ts_type(&TypeRef {
+                length: Some(32),
+                ..TypeRef::named("Bytes")
+            }),
+            "Uint8Array"
+        );
+        assert_eq!(
+            ts_type(&TypeRef {
+                maxval: Some(65535),
+                ..TypeRef::named("Uint")
+            }),
+            "bigint"
+        );
+        assert_eq!(ts_type(&TypeRef::named("Tuple")), "[]");
+        assert_eq!(ts_type(&TypeRef::named("Wat")), "unknown");
+    }
+
+    #[test]
+    fn versions_are_read_from_the_build_not_the_live_toolchain() {
+        let ci: ContractInfo = serde_json::from_str(REAL).unwrap();
+        assert_eq!(ci.compiler_version, "0.31.1");
+        assert_eq!(ci.language_version, "0.23.0");
+    }
+}
