@@ -4,6 +4,7 @@ pub mod analyze;
 pub mod artifacts;
 pub mod diagnostic;
 pub mod error;
+pub mod jobs;
 pub mod toolchain;
 pub mod workspace;
 
