@@ -47,13 +47,20 @@ impl Toolchain {
         })
     }
 
-    /// `compact compile [+VERSION] <args...>`. The `+VERSION` pin MUST come first.
-    pub(crate) async fn run_compile(&self, args: &[&str]) -> Result<Output, CoreError> {
+    /// The full argv for a `compact compile [+VERSION] <args...>` invocation.
+    /// Single source of truth so executed and error-reported commands can't drift.
+    fn compile_argv(&self, args: &[&str]) -> Vec<String> {
         let mut full: Vec<String> = vec!["compile".to_string()];
         if let Some(v) = &self.compiler_version {
             full.push(format!("+{v}"));
         }
         full.extend(args.iter().map(|s| s.to_string()));
+        full
+    }
+
+    /// `compact compile [+VERSION] <args...>`. The `+VERSION` pin MUST come first.
+    pub(crate) async fn run_compile(&self, args: &[&str]) -> Result<Output, CoreError> {
+        let full = self.compile_argv(args);
         let refs: Vec<&str> = full.iter().map(String::as_str).collect();
         self.run(&refs).await
     }
@@ -66,12 +73,37 @@ impl Toolchain {
             self.run(args).await?
         };
         if out.status != 0 {
+            let argv = if compile {
+                self.compile_argv(args)
+            } else {
+                args.iter().map(|s| s.to_string()).collect()
+            };
             return Err(CoreError::ToolchainFailed {
-                cmd: format!("{} {}", self.bin, args.join(" ")),
+                cmd: format!("{} {}", self.bin, argv.join(" ")),
                 code: out.status,
                 stderr: out.stderr,
             });
         }
         Ok(out.stdout.trim().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compile_argv_places_the_pin_first_and_is_the_error_source_of_truth() {
+        let tc = Toolchain::new("compact", None);
+        assert_eq!(
+            tc.compile_argv(&["--version"]),
+            vec!["compile", "--version"]
+        );
+
+        let pinned = Toolchain::new("compact", Some("0.31.0".to_string()));
+        assert_eq!(
+            pinned.compile_argv(&["--language-version"]),
+            vec!["compile", "+0.31.0", "--language-version"]
+        );
     }
 }
