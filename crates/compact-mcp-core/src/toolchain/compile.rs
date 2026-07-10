@@ -94,13 +94,21 @@ impl Toolchain {
                 // back to 0 and `killpg(0, ...)` would signal OUR OWN process
                 // group — a self-inflicted kill.
                 if pid != 0 {
-                    proc::kill_group(pid);
+                    // `kill_group` is BLOCKING (SIGTERM -> 250ms -> SIGKILL via
+                    // thread::sleep) — proc.rs's own doc says never call it
+                    // directly from an async task. Hand it to a blocking thread;
+                    // fire-and-forget, since spawn_blocking runs to completion
+                    // even once the handle is dropped, and `killpg(pgid)` still
+                    // reaps the group even after `kill_on_drop` reaps the direct
+                    // child (the grandchild keeps the group alive).
+                    tokio::task::spawn_blocking(move || proc::kill_group(pid));
                 }
                 return Err(CoreError::Cancelled);
             }
             _ = tokio::time::sleep(timeout) => {
                 if pid != 0 {
-                    proc::kill_group(pid);
+                    // Off the async worker — see the cancel branch above.
+                    tokio::task::spawn_blocking(move || proc::kill_group(pid));
                 }
                 return Err(CoreError::Timeout(timeout));
             }
