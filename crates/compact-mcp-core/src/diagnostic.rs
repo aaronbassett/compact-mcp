@@ -59,8 +59,16 @@ impl Diagnostic {
         source_text: &str,
         file: &str,
     ) -> Self {
-        let v = compactp_diagnostics::render_json(d, source_text);
+        Self::from_render_json(&compactp_diagnostics::render_json(d, source_text), file)
+    }
 
+    /// Re-shape a `compactp_diagnostics::render_json` envelope into our model.
+    ///
+    /// Split out from [`Diagnostic::from_compactp`] so tests can feed synthetic
+    /// envelopes for the `warning`/`note`/fallback severity branches the parser
+    /// never emits on its own — a future upstream field rename would otherwise
+    /// silently default and go unnoticed.
+    pub(crate) fn from_render_json(v: &serde_json::Value, file: &str) -> Self {
         let severity = match v["severity"].as_str() {
             Some("warning") => Severity::Warning,
             Some("note") => Severity::Note,
@@ -115,8 +123,49 @@ mod tests {
         assert_eq!(d.source, Source::Compactp);
         assert_eq!(d.severity, Severity::Error);
         assert_eq!(d.file.as_deref(), Some("a.compact"));
+        assert_eq!(d.code.as_deref(), Some("E1"));
         assert!(!d.raw);
         assert!(d.span.is_some());
+    }
+
+    /// Exercise the severity/code reshaping over synthetic `render_json`-shaped
+    /// envelopes. The real parser only emits `error`, so this is the only place
+    /// the `warning`/`note`/fallback branches are covered — a future upstream
+    /// rename of `severity`, `code.prefix`, or `code.number` would silently
+    /// default here and this test is what catches it.
+    #[test]
+    fn maps_severity_and_code_from_the_render_json_shape() {
+        let envelope = |severity: serde_json::Value, prefix: &str, number: u64| {
+            serde_json::json!({
+                "severity": severity,
+                "code": { "prefix": prefix, "number": number },
+                "message": "synthetic",
+                "primary_span": {
+                    "start": { "offset": 0, "line": 1, "column": 1 },
+                    "end": { "offset": 1, "line": 1, "column": 2 },
+                },
+                "secondary_spans": [],
+                "notes": [],
+            })
+        };
+
+        let warning =
+            Diagnostic::from_render_json(&envelope("warning".into(), "W", 7), "a.compact");
+        assert_eq!(warning.severity, Severity::Warning);
+        assert_eq!(warning.code.as_deref(), Some("W7"));
+
+        let note = Diagnostic::from_render_json(&envelope("note".into(), "N", 3), "a.compact");
+        assert_eq!(note.severity, Severity::Note);
+
+        let unknown =
+            Diagnostic::from_render_json(&envelope("catastrophe".into(), "E", 9), "a.compact");
+        assert_eq!(unknown.severity, Severity::Error);
+
+        // Missing `severity` key entirely also falls back to Error.
+        let mut missing = envelope("error".into(), "E", 1);
+        missing.as_object_mut().unwrap().remove("severity");
+        let missing = Diagnostic::from_render_json(&missing, "a.compact");
+        assert_eq!(missing.severity, Severity::Error);
     }
 
     #[test]
