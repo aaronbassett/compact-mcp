@@ -1,4 +1,5 @@
 pub mod fmt;
+pub mod proc;
 pub mod versions;
 
 use std::process::Stdio;
