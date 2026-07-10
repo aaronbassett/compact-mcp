@@ -1,6 +1,8 @@
+use std::path::Path;
+
 use serde::Serialize;
 
-use super::Toolchain;
+use super::{Output, Toolchain};
 use crate::{CoreError, Diagnostic, Workspace, analyze};
 
 #[derive(Debug, Clone)]
@@ -59,21 +61,57 @@ impl Toolchain {
         write: bool,
         subcommand: &str,
     ) -> Result<FormatOutcome, CoreError> {
-        let (before, path_on_disk) = match &input {
+        // Precondition, enforced BEFORE the parse gate: `write: true` can only
+        // rewrite a file on disk, never inline source. Hoisted so the same invalid
+        // combination fails identically regardless of whether the content happens
+        // to parse — otherwise `write + Source` would surface as `parse_failure`
+        // for broken input and `InvalidArgs` for valid input.
+        if write && matches!(input, FmtInput::Source(_)) {
+            return Err(CoreError::InvalidArgs(
+                "`write: true` requires `path`, not `source`".into(),
+            ));
+        }
+
+        // Read the input and enforce the source-size cap. Core does its own fs
+        // read here, so core must enforce `MAX_SOURCE_BYTES`: `analyze::diagnostics`
+        // lexes the entire input before its depth guard runs. For a path, stat and
+        // reject BEFORE reading so an oversized file is never slurped into memory.
+        let (before, path_on_disk, label) = match &input {
             FmtInput::Path(p) => {
                 let resolved = ws.resolve(p)?;
-                (std::fs::read_to_string(&resolved)?, Some(resolved))
+                if std::fs::metadata(&resolved)?.len() as usize > crate::MAX_SOURCE_BYTES {
+                    return Err(CoreError::InvalidArgs(format!(
+                        "input exceeds maximum size ({} bytes)",
+                        crate::MAX_SOURCE_BYTES
+                    )));
+                }
+                (
+                    std::fs::read_to_string(&resolved)?,
+                    Some(resolved),
+                    p.clone(),
+                )
             }
-            FmtInput::Source(s) => (s.clone(), None),
+            FmtInput::Source(s) => {
+                if s.len() > crate::MAX_SOURCE_BYTES {
+                    return Err(CoreError::InvalidArgs(format!(
+                        "input exceeds maximum size ({} bytes)",
+                        crate::MAX_SOURCE_BYTES
+                    )));
+                }
+                (s.clone(), None, "<source>".to_string())
+            }
         };
 
-        // Gate: never let the formatter answer a parse question.
-        let parsed = analyze::diagnostics(&before, "<input>", None);
+        // Gate: never let the formatter answer a parse question. Thread the real
+        // filename through for a path so diagnostics point at the user's file.
+        let parsed = analyze::diagnostics(&before, &label, None);
         if !parsed.success {
             return Ok(FormatOutcome::parse_failure(parsed.diagnostics));
         }
 
         if write {
+            // Unreachable given the precondition above, but kept as a
+            // belt-and-suspenders that returns the same error rather than panics.
             let Some(target) = path_on_disk else {
                 return Err(CoreError::InvalidArgs(
                     "`write: true` requires `path`, not `source`".into(),
@@ -81,11 +119,7 @@ impl Toolchain {
             };
             let out = self.run(&[subcommand, &target.to_string_lossy()]).await?;
             if out.status != 0 {
-                return Err(CoreError::ToolchainFailed {
-                    cmd: format!("compact {subcommand}"),
-                    code: out.status,
-                    stderr: format!("{}{}", out.stdout, out.stderr),
-                });
+                return Err(self.toolchain_failed(subcommand, &target, out));
             }
             let after = std::fs::read_to_string(&target)?;
             return Ok(FormatOutcome {
@@ -101,11 +135,7 @@ impl Toolchain {
         let copy = scope.write_file("input.compact", &before)?;
         let out = self.run(&[subcommand, &copy.to_string_lossy()]).await?;
         if out.status != 0 {
-            return Err(CoreError::ToolchainFailed {
-                cmd: format!("compact {subcommand}"),
-                code: out.status,
-                stderr: format!("{}{}", out.stdout, out.stderr),
-            });
+            return Err(self.toolchain_failed(subcommand, &copy, out));
         }
         let after = std::fs::read_to_string(&copy)?;
 
@@ -115,6 +145,22 @@ impl Toolchain {
             formatted: Some(after),
             diagnostics: Vec::new(),
         })
+    }
+
+    /// Build a `ToolchainFailed` from a non-zero `compact <subcommand> <path>`
+    /// run. Reports the real `bin` and target path (not a hardcoded `"compact"`)
+    /// and joins stdout+stderr with a newline only when both are non-empty, so the
+    /// two streams never run together on one line — consistent with `check`.
+    fn toolchain_failed(&self, subcommand: &str, target: &Path, out: Output) -> CoreError {
+        let stderr = match (out.stdout.is_empty(), out.stderr.is_empty()) {
+            (false, false) => format!("{}\n{}", out.stdout, out.stderr),
+            _ => format!("{}{}", out.stdout, out.stderr),
+        };
+        CoreError::ToolchainFailed {
+            cmd: format!("{} {subcommand} {}", self.bin, target.display()),
+            code: out.status,
+            stderr,
+        }
     }
 }
 
@@ -205,17 +251,57 @@ mod tests {
     }
 
     /// The brief's tests cover `format` but not `fixup` (which shares the `rewrite`
-    /// path). This proves the `fixup` path runs end-to-end without over-asserting:
-    /// we don't know whether `compact fixup` wants to change an already-canonical
-    /// file, so we only assert `ok`.
+    /// path). `compact fixup` is a deterministic no-op on an already-canonical file,
+    /// so this asserts the full contract: `ok`, no reported change, and — since this
+    /// is non-write mode — the original file left byte-identical on disk.
     #[tokio::test]
     #[cfg_attr(not(feature = "toolchain-tests"), ignore)]
-    async fn fixup_runs_end_to_end_on_a_clean_file() {
+    async fn fixup_is_a_noop_on_a_clean_file() {
         let (d, w) = ws();
         let clean = "pragma language_version >= 0.23;\n\nimport CompactStandardLibrary;\n\nexport ledger a: Counter;\n";
         std::fs::write(d.path().join("clean.compact"), clean).unwrap();
         let tc = Toolchain::new("compact", None);
         let out = tc.fixup(&w, "clean.compact", false).await.unwrap();
         assert!(out.ok);
+        assert!(
+            !out.changed,
+            "fixup on already-canonical source must be a no-op"
+        );
+        let on_disk = std::fs::read_to_string(d.path().join("clean.compact")).unwrap();
+        assert_eq!(
+            on_disk, clean,
+            "non-write fixup must leave the file byte-identical"
+        );
+    }
+
+    // --- Hermetic tests: these short-circuit BEFORE any subprocess, so they run
+    //     without `--features toolchain-tests` and need no `compact` binary. ---
+
+    #[tokio::test]
+    async fn oversize_source_is_rejected_before_any_subprocess() {
+        // Over the cap by one byte. `rewrite` must reject on size before it ever
+        // lexes the input or spawns the formatter.
+        let (_d, w) = ws();
+        let tc = Toolchain::new("compact", None);
+        let huge = "x".repeat(crate::MAX_SOURCE_BYTES + 1);
+        let err = tc
+            .format(&w, FmtInput::Source(huge), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::InvalidArgs(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn write_with_inline_source_is_rejected_before_the_parse_gate() {
+        // `write: true` + inline `Source` is an unconditional `InvalidArgs`
+        // precondition, never a `parse_failure` — even for content that does not
+        // parse (BROKEN). This proves the precondition beats the parse gate.
+        let (_d, w) = ws();
+        let tc = Toolchain::new("compact", None);
+        let err = tc
+            .format(&w, FmtInput::Source(BROKEN.into()), true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::InvalidArgs(_)), "got {err:?}");
     }
 }
