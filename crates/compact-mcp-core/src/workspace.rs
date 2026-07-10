@@ -101,7 +101,7 @@ impl Workspace {
 /// separators, no `.` or `..`, not empty, not absolute, and (on Windows) no
 /// drive-relative prefix such as `C:`. Such names can be joined onto a trusted
 /// base without escaping or redirecting it.
-fn is_single_normal_component(name: &str) -> bool {
+pub(crate) fn is_single_normal_component(name: &str) -> bool {
     let mut components = Path::new(name).components();
     matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
 }

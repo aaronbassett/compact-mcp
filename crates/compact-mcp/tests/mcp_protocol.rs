@@ -188,6 +188,49 @@ async fn zkir_stats_tool_reports_stats_and_absent() {
 }
 
 #[tokio::test]
+async fn zkir_stats_tool_reports_proof_true_missing_zkir_honestly() {
+    // A partial/incomplete build: `increment` is proof:true but its .zkir was
+    // never written. The tool must report it absent with an HONEST reason, not
+    // the false "proof:false" one that would apply only to `reveal`.
+    let dir = tempfile::tempdir().unwrap();
+    let compiler = dir.path().join("build/compiler");
+    std::fs::create_dir_all(&compiler).unwrap();
+    std::fs::write(compiler.join("contract-info.json"), CI_FIXTURE).unwrap();
+    let ws = compact_mcp_core::Workspace::new(dir.path()).unwrap();
+
+    let (client_t, server_t) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        let _ = compact_mcp::server::CompactMcp::new(ws)
+            .serve(server_t)
+            .await
+            .expect("server failed to start")
+            .waiting()
+            .await;
+    });
+    let client = ().serve(client_t).await.unwrap();
+
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("zkir_stats").with_arguments(
+                serde_json::json!({ "target_dir": "build" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_ne!(res.is_error, Some(true), "{:?}", res.content);
+    let text = format!("{:?}", res.content);
+    assert!(
+        text.contains("build may be incomplete"),
+        "a proof:true circuit with no .zkir must be reported honestly, not as proof:false: {text}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
 async fn lists_the_four_analysis_tools_and_diagnoses_a_broken_contract() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("bad.compact"), "ledger count Field;").unwrap();

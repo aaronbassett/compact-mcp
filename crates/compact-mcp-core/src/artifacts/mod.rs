@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::CoreError;
+use crate::workspace::is_single_normal_component;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CircuitArtifact {
@@ -30,7 +31,9 @@ pub struct CircuitArtifact {
 #[derive(Debug, Clone, Serialize)]
 pub struct Artifacts {
     pub contract_info: ContractInfo,
-    /// True when `keys/` contains anything. A `--skip-zk` build never creates it.
+    /// True when at least one circuit has a discovered prover key. A `--skip-zk`
+    /// build emits none. (Tied to recognized key files, not merely a non-empty
+    /// `keys/` dir, so a stray file is not a false positive.)
     pub proving_keys: bool,
     /// Every file under the target dir, relative. We DISCOVER rather than assume.
     pub files: Vec<String>,
@@ -57,22 +60,34 @@ pub fn scan(target_dir: &Path) -> Result<Artifacts, CoreError> {
             .flatten()
     };
 
-    let circuits = info
+    let circuits: Vec<CircuitArtifact> = info
         .circuits
         .iter()
-        .map(|c| CircuitArtifact {
-            name: c.name.clone(),
-            proof: c.proof,
-            zkir: rel(target_dir.join(format!("zkir/{}.zkir", c.name))),
-            bzkir: rel(target_dir.join(format!("zkir/{}.bzkir", c.name))),
-            prover_key: rel(target_dir.join(format!("keys/{}.prover", c.name))),
-            verifier_key: rel(target_dir.join(format!("keys/{}.verifier", c.name))),
+        .map(|c| {
+            // A circuit name is formatted directly into artifact paths. A real
+            // name is a plain identifier, but a crafted contract-info.json could
+            // put `..`/separators here and escape `target_dir`. Only look up
+            // artifacts when the name is a single normal path component — the
+            // same guard the workspace uses for temp-file names.
+            let safe = is_single_normal_component(&c.name);
+            let art = |subdir: &str, ext: &str| -> Option<String> {
+                if !safe {
+                    return None;
+                }
+                rel(target_dir.join(format!("{subdir}/{}.{ext}", c.name)))
+            };
+            CircuitArtifact {
+                name: c.name.clone(),
+                proof: c.proof,
+                zkir: art("zkir", "zkir"),
+                bzkir: art("zkir", "bzkir"),
+                prover_key: art("keys", "prover"),
+                verifier_key: art("keys", "verifier"),
+            }
         })
         .collect();
 
-    let proving_keys = std::fs::read_dir(target_dir.join("keys"))
-        .map(|mut d| d.next().is_some())
-        .unwrap_or(false);
+    let proving_keys = circuits.iter().any(|c| c.prover_key.is_some());
 
     Ok(Artifacts {
         contract_info: info,
@@ -84,8 +99,18 @@ pub fn scan(target_dir: &Path) -> Result<Artifacts, CoreError> {
 
 fn collect(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(), CoreError> {
     for entry in std::fs::read_dir(dir)? {
-        let p = entry?.path();
-        if p.is_dir() {
+        let entry = entry?;
+        // Skip symlinks entirely. `Path::is_dir()` follows them, so a symlink to
+        // an outside directory would leak external filenames into `files` (they
+        // stay lexically prefixed by `root`), and a symlink cycle would recurse
+        // unboundedly. `entry.file_type()` reports the link itself, not its
+        // target. A real compiler output tree contains no symlinks.
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            continue;
+        }
+        let p = entry.path();
+        if ft.is_dir() {
             collect(root, &p, out)?;
         } else if let Ok(r) = p.strip_prefix(root) {
             out.push(r.to_string_lossy().into_owned());
@@ -155,5 +180,56 @@ mod tests {
             scan(&d.path().join("nope")),
             Err(crate::CoreError::ArtifactMissing(_))
         ));
+    }
+
+    #[test]
+    fn a_crafted_circuit_name_cannot_escape_the_target_dir() {
+        // A malicious contract-info.json names a circuit `../../secret`. Even
+        // with a matching file planted OUTSIDE target_dir (exactly where the
+        // `..` would resolve), scan must not surface a path to it: an unsafe
+        // name yields None for every artifact field.
+        let d = tempfile::tempdir().unwrap();
+        let t = d.path().join("target");
+        std::fs::create_dir_all(t.join("compiler")).unwrap();
+        let ci = r#"{
+          "compiler-version":"0.31.1","language-version":"0.23.0","runtime-version":"0.16.0",
+          "circuits":[{"name":"../../secret","pure":false,"proof":true,"arguments":[],"result-type":{"type-name":"Field"}}],
+          "witnesses":[],"contracts":[],"ledger":[]
+        }"#;
+        std::fs::write(t.join("compiler/contract-info.json"), ci).unwrap();
+        // `target/zkir/../../secret.zkir` resolves to `<tempdir>/secret.zkir`.
+        std::fs::write(d.path().join("secret.zkir"), "{}").unwrap();
+
+        let a = scan(&t).unwrap();
+        let c = &a.circuits[0];
+        assert_eq!(c.name, "../../secret");
+        assert!(
+            c.zkir.is_none(),
+            "an unsafe circuit name must not resolve to an out-of-tree file"
+        );
+        assert!(c.bzkir.is_none() && c.prover_key.is_none() && c.verifier_key.is_none());
+        assert!(!a.proving_keys);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_does_not_follow_symlinks_out_of_the_tree() {
+        // A symlink inside the target pointing at an outside dir must not leak
+        // that dir's filenames into `files`, nor be recursed into.
+        let d = tempfile::tempdir().unwrap();
+        let t = d.path().join("target");
+        std::fs::create_dir_all(t.join("compiler")).unwrap();
+        std::fs::write(t.join("compiler/contract-info.json"), CI).unwrap();
+        let outside = d.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("leak.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(&outside, t.join("link")).unwrap();
+
+        let a = scan(&t).unwrap();
+        assert!(
+            !a.files.iter().any(|f| f.contains("leak.txt")),
+            "a symlinked-out dir must not leak into files: {:?}",
+            a.files
+        );
     }
 }

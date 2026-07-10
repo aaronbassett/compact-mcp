@@ -71,24 +71,25 @@ impl CompactMcp {
         let dir = self.workspace.resolve(&args.target_dir)?;
         let scanned = artifacts::scan(&dir)?;
 
-        let wanted: Vec<_> = scanned
-            .circuits
-            .iter()
-            .filter(|c| args.circuit.as_deref().is_none_or(|n| n == c.name))
-            .collect();
-
         // A named-but-unknown circuit is a caller-visible lookup failure, not a
         // protocol error: return it as a domain error (mapped to isError by the
-        // handler) so the agent SEES which circuit names actually exist.
-        if wanted.is_empty() {
+        // handler) so the agent SEES which circuit names actually exist. When no
+        // `circuit` is given we report every circuit, so an empty set there is a
+        // legitimately circuit-less contract — not an error.
+        if let Some(name) = args.circuit.as_deref()
+            && !scanned.circuits.iter().any(|c| c.name == name)
+        {
             let available: Vec<&str> = scanned.circuits.iter().map(|c| c.name.as_str()).collect();
             return Err(CoreError::InvalidArgs(format!(
-                "no circuit named {:?} in {}; available: {:?}",
-                args.circuit.as_deref().unwrap_or(""),
-                args.target_dir,
-                available
+                "no circuit named {name:?} in {}; available: {available:?}",
+                args.target_dir
             )));
         }
+
+        let wanted = scanned
+            .circuits
+            .iter()
+            .filter(|c| args.circuit.as_deref().is_none_or(|n| n == c.name));
 
         let mut stats = Vec::new();
         let mut absent = Vec::new();
@@ -98,9 +99,17 @@ impl CompactMcp {
                     let s = artifacts::zkir::stats(&c.name, &dir.join(rel))?;
                     stats.push(serde_json::to_value(s).unwrap());
                 }
+                // No `.zkir` on disk. A proof:false circuit never emits one; a
+                // proof:true circuit missing it means the build is incomplete —
+                // report both honestly rather than blaming proof:false for both.
                 None => absent.push(json!({
                     "circuit": c.name,
-                    "reason": "proof:false — no zkir emitted",
+                    "proof": c.proof,
+                    "reason": if c.proof {
+                        "proof:true but no .zkir found — build may be incomplete"
+                    } else {
+                        "proof:false — no zkir emitted"
+                    },
                 })),
             }
         }
