@@ -815,6 +815,97 @@ async fn a_failing_compile_returns_diagnostics_not_a_protocol_error() {
 }
 
 #[tokio::test]
+async fn witness_scaffold_tool_surfaces_a_missing_toolchain_as_an_is_error_result() {
+    // Hermetic: no real toolchain needed. `witness_scaffold` compiles straight
+    // away (no core parse gate), so a bogus binary fails fast with
+    // `ToolchainNotFound` before any compilation is attempted. That `CoreError`
+    // must surface as a successful call with `isError: true` carrying the
+    // message, never as an opaque protocol error.
+    let dir = tempfile::tempdir().unwrap();
+    let ws = compact_mcp_core::Workspace::new(dir.path()).unwrap();
+    let tc = compact_mcp_core::Toolchain::new("compact-does-not-exist-xyz", None);
+
+    let (client_t, server_t) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        let _ = compact_mcp::server::CompactMcp::with_toolchain(ws, tc)
+            .serve(server_t)
+            .await
+            .expect("server failed to start")
+            .waiting()
+            .await;
+    });
+    let client = ().serve(client_t).await.unwrap();
+
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("witness_scaffold").with_arguments(
+                serde_json::json!({ "source": "pragma language_version >= 0.23;\n" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.is_error,
+        Some(true),
+        "missing toolchain must be an is_error result: {:?}",
+        res.content
+    );
+    let text = format!("{:?}", res.content);
+    assert!(
+        text.contains("not found"),
+        "error result must carry the not-found message: {text}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg_attr(not(feature = "toolchain-tests"), ignore)]
+async fn witness_scaffold_tool_emits_a_typescript_stub() {
+    // Needs the real compiler: runs a --skip-zk compile into a temp dir, loads
+    // contract-info.json, and derives the TS stub from it. Verified live: this
+    // contract compiles exit 0 and produces a `lookup` witness with `key_0`/
+    // `idx_0` parameters (the compiler's own `_0` suffixing).
+    let dir = tempfile::tempdir().unwrap();
+    let ws = compact_mcp_core::Workspace::new(dir.path()).unwrap();
+
+    let (client_t, server_t) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        let _ = compact_mcp::server::CompactMcp::new(ws)
+            .serve(server_t)
+            .await
+            .expect("server failed to start")
+            .waiting()
+            .await;
+    });
+    let client = ().serve(client_t).await.unwrap();
+
+    let source = "pragma language_version >= 0.23;\nimport CompactStandardLibrary;\nexport ledger n: Counter;\nwitness lookup(key: Bytes<32>, idx: Uint<16>): Field;\nexport circuit put(): [] { const f = lookup(default<Bytes<32>>, 7); n.increment(1); }\n";
+
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("witness_scaffold").with_arguments(
+                serde_json::json!({ "source": source })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_ne!(res.is_error, Some(true), "{:?}", res.content);
+    let text = format!("{:?}", res.content);
+    assert!(text.contains("key_0"), "{text}");
+    assert!(text.contains("idx_0: bigint"), "{text}");
+    assert!(text.contains("not implemented"), "{text}");
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
 #[cfg_attr(not(feature = "toolchain-tests"), ignore)]
 async fn versions_tool_reports_both_parsers_and_a_skew_verdict() {
     let dir = tempfile::tempdir().unwrap();

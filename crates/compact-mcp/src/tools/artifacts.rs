@@ -59,6 +59,26 @@ impl CompactMcp {
             Err(e) => Ok(Self::json_result(json!({ "error": e.to_string() }), true)),
         }
     }
+
+    #[tool(
+        description = "Generate a TypeScript witness implementation stub for a contract. \
+                          Runs a fast --skip-zk compile into a temp directory, then derives \
+                          the stub from contract-info.json. Only witnesses that a circuit \
+                          actually calls are included."
+    )]
+    async fn witness_scaffold(
+        &self,
+        Parameters(input): Parameters<crate::tools::SourceInput>,
+    ) -> Result<CallToolResult, McpError> {
+        // read_input keeps McpError: the path/source XOR is a genuine
+        // request-shape error. Everything downstream is a runtime CoreError,
+        // surfaced as isError so the agent sees the message.
+        let (text, _) = self.read_input(&input)?;
+        match self.witness_scaffold_impl(text).await {
+            Ok((is_error, value)) => Ok(Self::json_result(value, is_error)),
+            Err(e) => Ok(Self::json_result(json!({ "error": e.to_string() }), true)),
+        }
+    }
 }
 
 impl CompactMcp {
@@ -114,5 +134,54 @@ impl CompactMcp {
             }
         }
         Ok(json!({ "circuits": stats, "absent": absent }))
+    }
+}
+
+impl CompactMcp {
+    /// Fallible core of `witness_scaffold`, returning `CoreError` so it is mapped
+    /// once at the handler. `(is_error, payload)`: a broken contract is a
+    /// successful call with `isError: true` carrying the compile outcome, exactly
+    /// as `compile` treats `out.ok == false`.
+    async fn witness_scaffold_impl(
+        &self,
+        text: String,
+    ) -> Result<(bool, serde_json::Value), compact_mcp_core::CoreError> {
+        use compact_mcp_core::toolchain::compile::CompileRequest;
+
+        // The scope holds BOTH the input file and the output dir; it must stay
+        // alive until we have loaded contract-info.json below (it is a local, so
+        // it drops at the end of this function — after `info` is read).
+        let scope = self.workspace.temp_scope("scaffold")?;
+        let src = scope.write_file("input.compact", &text)?;
+        let target = scope.path().join("out");
+
+        let req = CompileRequest {
+            source: src,
+            target_dir: target.clone(),
+            skip_zk: true,
+            no_communications_commitment: false,
+            source_root: None,
+        };
+        let out = self
+            .toolchain
+            .compile(
+                &req,
+                tokio_util::sync::CancellationToken::new(),
+                std::time::Duration::from_secs(300),
+            )
+            .await?;
+
+        if !out.ok {
+            return Ok((true, serde_json::to_value(out).unwrap()));
+        }
+
+        let info = compact_mcp_core::artifacts::ContractInfo::load(
+            &target.join("compiler/contract-info.json"),
+        )?;
+        let ts = compact_mcp_core::artifacts::scaffold::witnesses_ts(&info);
+        Ok((
+            false,
+            json!({ "typescript": ts, "witness_count": info.witnesses.len() }),
+        ))
     }
 }
