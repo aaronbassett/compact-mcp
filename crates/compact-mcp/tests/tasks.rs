@@ -94,3 +94,19 @@ async fn an_unknown_task_id_is_invalid_params() {
     );
     client.cancel().await.unwrap();
 }
+
+#[tokio::test]
+#[cfg_attr(not(feature = "toolchain-tests"), ignore)]
+async fn a_build_emits_progress_notifications() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        "tests/fixtures/counter.compact",
+        dir.path().join("c.compact"),
+    )
+    .unwrap();
+    let seen = compact_mcp::testing::compile_and_count_progress(dir.path(), "c.compact").await;
+    assert!(
+        seen >= 1,
+        "expected at least one notifications/progress, saw {seen}"
+    );
+}

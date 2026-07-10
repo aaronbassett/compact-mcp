@@ -2,15 +2,18 @@
 #![cfg(any(test, feature = "testing"))]
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rmcp::{
-    RoleClient, ServiceExt,
+    ClientHandler, RoleClient, ServiceExt,
     model::{
         CallToolRequestParams, CancelTaskParams, ClientRequest, GetTaskParams,
-        GetTaskPayloadParams, Request, ServerResult, TaskMetadata, TaskStatus,
+        GetTaskPayloadParams, NumberOrString, ProgressNotificationParam, ProgressToken, Request,
+        RequestParamsMeta, ServerResult, TaskMetadata, TaskStatus,
     },
     object,
-    service::RunningService,
+    service::{NotificationContext, RunningService},
 };
 
 use crate::server::CompactMcp;
@@ -105,4 +108,51 @@ pub async fn cancel_task(
         Ok(other) => Err(format!("unexpected: {other:?}")),
         Err(e) => Err(format!("{e:?}")),
     }
+}
+
+/// A client that does nothing but count `notifications/progress`.
+#[derive(Clone, Default)]
+pub struct ProgressCounter(pub Arc<AtomicUsize>);
+
+impl ClientHandler for ProgressCounter {
+    async fn on_progress(
+        &self,
+        _params: ProgressNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Run a full build with a `progressToken` attached; return how many progress
+/// notifications the server sent.
+pub async fn compile_and_count_progress(dir: &Path, path: &str) -> usize {
+    let ws = compact_mcp_core::Workspace::new(dir).unwrap();
+    let (client_t, server_t) = tokio::io::duplex(1 << 20);
+    tokio::spawn(async move {
+        let _ = CompactMcp::new(ws)
+            .serve(server_t)
+            .await
+            .expect("server failed to start")
+            .waiting()
+            .await;
+    });
+
+    let counter = ProgressCounter::default();
+    let seen = counter.0.clone();
+    let client = counter.serve(client_t).await.unwrap();
+
+    // CallToolRequestParams has no `with_meta`; attach the progress token via the
+    // mutating RequestParamsMeta accessor.
+    let mut params = CallToolRequestParams::new("compile")
+        .with_arguments(object!({ "path": path, "skip_zk": false }));
+    params.set_progress_token(ProgressToken(NumberOrString::Number(1)));
+
+    client
+        .call_tool(params)
+        .await
+        .expect("compile should succeed");
+
+    client.cancel().await.unwrap();
+    seen.load(Ordering::SeqCst)
 }

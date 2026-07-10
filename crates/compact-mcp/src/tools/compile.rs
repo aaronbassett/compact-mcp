@@ -3,7 +3,11 @@ use std::time::Duration;
 use compact_mcp_core::CoreError;
 use compact_mcp_core::toolchain::compile::{CompileOutcome, CompileRequest};
 use rmcp::{
-    ErrorData as McpError, handler::server::wrapper::Parameters, model::CallToolResult, schemars,
+    ErrorData as McpError, RoleServer,
+    handler::server::wrapper::Parameters,
+    model::{CallToolResult, ProgressNotificationParam},
+    schemars,
+    service::RequestContext,
     tool, tool_router,
 };
 
@@ -43,9 +47,39 @@ impl CompactMcp {
     )]
     async fn compile(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<CompileArgs>,
     ) -> Result<CallToolResult, McpError> {
         let (text, _label) = self.read_input(&args.input)?;
+
+        // Honest heartbeat: compactc reports no stages, so send elapsed seconds as
+        // `progress` with NO `total` — a fabricated percentage would be a lie. Only
+        // when the caller attached a progressToken. `interval`'s FIRST tick fires
+        // immediately, so even a sub-second build emits at least one notification.
+        let heartbeat = ctx.meta.get_progress_token().map(|token| {
+            let peer = ctx.peer.clone();
+            let stage = if args.skip_zk {
+                "compiling"
+            } else {
+                "compiling and generating proving keys"
+            };
+            tokio::spawn(async move {
+                let start = std::time::Instant::now();
+                let mut tick = tokio::time::interval(Duration::from_secs(2));
+                loop {
+                    tick.tick().await;
+                    let param = ProgressNotificationParam::new(
+                        token.clone(),
+                        start.elapsed().as_secs_f64(),
+                    )
+                    .with_message(stage);
+                    // Peer gone / transport closed -> stop pinging.
+                    if peer.notify_progress(param).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        });
 
         // A `CoreError` from resolving the workspace, scratch files, or the
         // compiler subprocess itself is a runtime/domain failure, not a
@@ -54,7 +88,7 @@ impl CompactMcp {
         // `CoreError` here surfaces as a successful call with `isError: true`,
         // matching the other toolchain tools. `McpError` stays reserved for the
         // `path`/`source` XOR check above.
-        match self.compile_impl(&args, text).await {
+        let outcome = match self.compile_impl(&args, text).await {
             Ok((out, target_dir)) => {
                 let is_error = !out.ok;
                 let mut value = serde_json::to_value(out).unwrap();
@@ -65,7 +99,12 @@ impl CompactMcp {
                 serde_json::json!({ "error": e.to_string() }),
                 true,
             )),
+        };
+
+        if let Some(h) = heartbeat {
+            h.abort();
         }
+        outcome
     }
 }
 
