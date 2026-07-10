@@ -98,3 +98,70 @@ async fn ast_symbols_and_stats_all_succeed_on_valid_source() {
 
     client.cancel().await.unwrap();
 }
+
+#[tokio::test]
+async fn ast_symbols_and_stats_flag_over_depth_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = compact_mcp_core::Workspace::new(dir.path()).unwrap();
+
+    let (client_t, server_t) = tokio::io::duplex(4096);
+    tokio::spawn(async move {
+        let _ = compact_mcp::server::CompactMcp::new(ws)
+            .serve(server_t)
+            .await
+            .expect("server failed to start")
+            .waiting()
+            .await;
+    });
+    let client = ().serve(client_t).await.unwrap();
+
+    // A 2000-link postfix call chain: shallow brackets, but a tree ~2000 deep that would
+    // SIGABRT on Drop if parsed. The guard refuses it — and ast/symbols/stats must SIGNAL that
+    // refusal, not report the byte-identical shape of a genuinely empty file.
+    let deep = format!(
+        "pragma language_version >= 0.23;\nexport pure circuit f(x: Field): Field {{ return x{}; }}\n",
+        "()".repeat(2000)
+    );
+    let deep_args = serde_json::json!({ "source": deep })
+        .as_object()
+        .unwrap()
+        .clone();
+
+    for tool in ["ast", "symbols", "stats"] {
+        let res = client
+            .call_tool(CallToolRequestParams::new(tool).with_arguments(deep_args.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            res.is_error,
+            Some(true),
+            "{tool} must flag over-depth refusal as an error: {:?}",
+            res.content
+        );
+        let text = format!("{:?}", res.content);
+        assert!(
+            text.contains("structural depth"),
+            "{tool} refusal must carry the depth message: {text}"
+        );
+    }
+
+    // No false positive: a normal small contract is NOT flagged by any of the three.
+    let ok_args = serde_json::json!({ "source": "ledger round: Counter;" })
+        .as_object()
+        .unwrap()
+        .clone();
+    for tool in ["ast", "symbols", "stats"] {
+        let res = client
+            .call_tool(CallToolRequestParams::new(tool).with_arguments(ok_args.clone()))
+            .await
+            .unwrap();
+        assert_ne!(
+            res.is_error,
+            Some(true),
+            "{tool} wrongly flagged a normal contract: {:?}",
+            res.content
+        );
+    }
+
+    client.cancel().await.unwrap();
+}

@@ -39,6 +39,12 @@ impl CompactMcp {
         Parameters(input): Parameters<SourceInput>,
     ) -> Result<CallToolResult, McpError> {
         let (text, _) = self.read_input(&input)?;
+        if compact_mcp_core::analyze::is_over_max_depth(&text) {
+            return Ok(Self::json_result(
+                serde_json::json!({ "error": compact_mcp_core::analyze::depth_refusal_message() }),
+                true,
+            ));
+        }
         Ok(Self::json_result(
             compact_mcp_core::analyze::ast_json(&text),
             false,
@@ -54,6 +60,12 @@ impl CompactMcp {
         Parameters(input): Parameters<SourceInput>,
     ) -> Result<CallToolResult, McpError> {
         let (text, _) = self.read_input(&input)?;
+        if compact_mcp_core::analyze::is_over_max_depth(&text) {
+            return Ok(Self::json_result(
+                serde_json::json!({ "error": compact_mcp_core::analyze::depth_refusal_message() }),
+                true,
+            ));
+        }
         let s = compact_mcp_core::analyze::symbols(&text);
         Ok(Self::json_result(serde_json::to_value(s).unwrap(), false))
     }
@@ -64,6 +76,12 @@ impl CompactMcp {
         Parameters(input): Parameters<SourceInput>,
     ) -> Result<CallToolResult, McpError> {
         let (text, _) = self.read_input(&input)?;
+        if compact_mcp_core::analyze::is_over_max_depth(&text) {
+            return Ok(Self::json_result(
+                serde_json::json!({ "error": compact_mcp_core::analyze::depth_refusal_message() }),
+                true,
+            ));
+        }
         let s = compact_mcp_core::analyze::stats(&text);
         Ok(Self::json_result(serde_json::to_value(s).unwrap(), false))
     }

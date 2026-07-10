@@ -108,6 +108,17 @@ pub fn structural_depth(source: &str) -> usize {
     peak
 }
 
+/// True when `source` is too structurally deep to parse safely (see [`structural_depth`]).
+/// The four analysis entry points refuse such input; tool handlers use this to signal it.
+pub fn is_over_max_depth(source: &str) -> bool {
+    structural_depth(source) > MAX_STRUCTURAL_DEPTH
+}
+
+/// The refusal message shared by every over-depth refusal, so the wording lives in one place.
+pub fn depth_refusal_message() -> String {
+    format!("input structural depth exceeds maximum ({MAX_STRUCTURAL_DEPTH}); refusing to parse")
+}
+
 /// Parser options we use everywhere. `max_depth` is pinned explicitly (not left to the
 /// upstream default) so a future `compactp` change cannot silently remove our recursion bound.
 fn parse_opts() -> ParseOptions {
@@ -137,7 +148,7 @@ pub struct Stats {
 }
 
 pub(crate) fn parse_root(source: &str) -> (SyntaxNode, Vec<compactp_diagnostics::Diagnostic>) {
-    if structural_depth(source) > MAX_STRUCTURAL_DEPTH {
+    if is_over_max_depth(source) {
         // Parse the empty string: a valid, shallow SOURCE_FILE root with no items.
         let empty = compactp_parser::parse_with("", parse_opts());
         return (SyntaxNode::new_root(empty.green), Vec::new());
@@ -147,13 +158,11 @@ pub(crate) fn parse_root(source: &str) -> (SyntaxNode, Vec<compactp_diagnostics:
 }
 
 pub fn diagnostics(source: &str, file: &str, max: Option<usize>) -> ParseOutcome {
-    if structural_depth(source) > MAX_STRUCTURAL_DEPTH {
+    if is_over_max_depth(source) {
         let d = Diagnostic {
             severity: crate::Severity::Error,
             source: crate::Source::Compactp,
-            message: format!(
-                "input structural depth exceeds maximum ({MAX_STRUCTURAL_DEPTH}); refusing to parse"
-            ),
+            message: depth_refusal_message(),
             file: Some(file.to_string()),
             span: None,
             code: None,
@@ -190,7 +199,7 @@ pub fn diagnostics(source: &str, file: &str, max: Option<usize>) -> ParseOutcome
 pub fn stats(source: &str) -> Stats {
     let token_count = compactp_lexer::lex(source).len();
 
-    if structural_depth(source) > MAX_STRUCTURAL_DEPTH {
+    if is_over_max_depth(source) {
         return Stats {
             file_size_bytes: source.len(),
             token_count,
@@ -299,6 +308,20 @@ mod tests {
         assert!(structural_depth(&long_chain) > MAX_STRUCTURAL_DEPTH);
         let short_chain = format!("{}x", "x+".repeat(10));
         assert!(structural_depth(&short_chain) <= MAX_STRUCTURAL_DEPTH);
+    }
+
+    #[test]
+    fn is_over_max_depth_and_message_are_the_shared_source_of_truth() {
+        let deep = format!("{}x", "x+".repeat(1000));
+        assert!(is_over_max_depth(&deep));
+        assert_eq!(
+            is_over_max_depth(&deep),
+            structural_depth(&deep) > MAX_STRUCTURAL_DEPTH
+        );
+        assert!(!is_over_max_depth("ledger count: Counter;"));
+        // The one place the refusal wording lives; tool handlers reuse it verbatim.
+        assert!(depth_refusal_message().contains("structural depth"));
+        assert!(depth_refusal_message().contains(&MAX_STRUCTURAL_DEPTH.to_string()));
     }
 
     /// The core regression guard: enumerate EVERY chain-forming construct the parser's Pratt loop
