@@ -115,6 +115,13 @@ pub async fn cancel_task(
 pub struct ProgressCounter(pub Arc<AtomicUsize>);
 
 impl ClientHandler for ProgressCounter {
+    // KEEP THIS YIELD-FREE (no `.await`). `compile_and_count_progress` relies on
+    // it: on the single-threaded test runtime, the server writes its progress
+    // notification to the stream BEFORE the tool response, so the client's
+    // notification task runs this increment to completion before the response
+    // event is dispatched — making `seen >= 1` reliable without waiting. Adding
+    // an await here (or switching the test to a multi-thread runtime) could
+    // reintroduce a delivery race.
     async fn on_progress(
         &self,
         _params: ProgressNotificationParam,
@@ -148,10 +155,18 @@ pub async fn compile_and_count_progress(dir: &Path, path: &str) -> usize {
         .with_arguments(object!({ "path": path, "skip_zk": false }));
     params.set_progress_token(ProgressToken(NumberOrString::Number(1)));
 
-    client
+    let res = client
         .call_tool(params)
         .await
-        .expect("compile should succeed");
+        .expect("the tools/call RPC should round-trip");
+    // The RPC succeeding only means the round-trip worked; assert the compile
+    // itself did not fail, so a silently-broken build can't pass this test.
+    assert_ne!(
+        res.is_error,
+        Some(true),
+        "compile reported an error: {:?}",
+        res.content
+    );
 
     client.cancel().await.unwrap();
     seen.load(Ordering::SeqCst)
