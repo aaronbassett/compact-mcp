@@ -96,19 +96,25 @@ impl Toolchain {
                 if pid != 0 {
                     // `kill_group` is BLOCKING (SIGTERM -> 250ms -> SIGKILL via
                     // thread::sleep) — proc.rs's own doc says never call it
-                    // directly from an async task. Hand it to a blocking thread;
-                    // fire-and-forget, since spawn_blocking runs to completion
-                    // even once the handle is dropped, and `killpg(pgid)` still
-                    // reaps the group even after `kill_on_drop` reaps the direct
-                    // child (the grandchild keeps the group alive).
-                    tokio::task::spawn_blocking(move || proc::kill_group(pid));
+                    // directly from an async task, so run it on a blocking thread.
+                    // AWAIT it (rather than fire-and-forget): the caller holds the
+                    // BuildGate permit across this compile, and awaiting keeps the
+                    // permit held until the kill sequence finishes — otherwise a
+                    // queued build could grab the single concurrency slot and
+                    // start a second compactc while this one is still alive.
+                    // Awaiting a spawn_blocking handle parks this task
+                    // cooperatively; it does NOT block the async worker. `killpg`
+                    // still reaps the group even after `kill_on_drop` reaps the
+                    // direct child (the grandchild keeps the group alive).
+                    let _ = tokio::task::spawn_blocking(move || proc::kill_group(pid)).await;
                 }
                 return Err(CoreError::Cancelled);
             }
             _ = tokio::time::sleep(timeout) => {
                 if pid != 0 {
-                    // Off the async worker — see the cancel branch above.
-                    tokio::task::spawn_blocking(move || proc::kill_group(pid));
+                    // Off the async worker, and awaited so the gate permit is held
+                    // until the kill completes — see the cancel branch above.
+                    let _ = tokio::task::spawn_blocking(move || proc::kill_group(pid)).await;
                 }
                 return Err(CoreError::Timeout(timeout));
             }

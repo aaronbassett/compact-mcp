@@ -71,10 +71,20 @@ async fn cancelling_a_build_task_reaps_the_whole_process_group() {
     );
     assert_eq!(task_status(&client, &id).await, TaskStatus::Cancelled);
 
-    // Give SIGTERM -> SIGKILL time to land.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // After SIGTERM->SIGKILL the grandchild is a zombie until its subreaper
+    // (init/launchd) reaps it, and `kill -0` reports a zombie as alive — so poll
+    // until it's fully gone rather than betting on a fixed duration that a loaded
+    // CI box could blow past (mirrors the proc.rs kill_group unit test).
+    let mut reaped = false;
+    for _ in 0..60 {
+        if !is_alive(grandchild) {
+            reaped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert!(
-        !is_alive(grandchild),
+        reaped,
         "grandchild {grandchild} was orphaned — the process group was not killed"
     );
 
