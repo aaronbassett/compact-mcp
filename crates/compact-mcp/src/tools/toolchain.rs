@@ -1,7 +1,16 @@
-use rmcp::{ErrorData as McpError, model::CallToolResult, tool, tool_router};
+use rmcp::{
+    ErrorData as McpError, handler::server::wrapper::Parameters, model::CallToolResult, schemars,
+    tool, tool_router,
+};
 use serde_json::json;
 
 use crate::server::CompactMcp;
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct UpdateArgs {
+    /// A specific compiler version, e.g. "0.31.1". Omit for the latest.
+    pub version: Option<String>,
+}
 
 /// `compact list` prints lines like:
 ///   `→ 0.31.1 - x86_macos, aarch64_macos, ...`
@@ -75,6 +84,34 @@ impl CompactMcp {
                 json!({ "up_to_date": out.contains("Up to date"), "raw": out }),
                 false,
             )),
+            Err(e) => Ok(Self::json_result(json!({ "error": e.to_string() }), true)),
+        }
+    }
+}
+
+#[tool_router(router = mutation_router, vis = "pub(crate)")]
+impl CompactMcp {
+    #[tool(
+        description = "Install or update the Compact compiler. Downloads a binary and \
+                          writes to the toolchain directory."
+    )]
+    async fn toolchain_update(
+        &self,
+        Parameters(args): Parameters<UpdateArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.toolchain.update(args.version.as_deref()).await {
+            Ok(raw) => Ok(Self::json_result(json!({ "raw": raw.trim() }), false)),
+            Err(e) => Ok(Self::json_result(json!({ "error": e.to_string() }), true)),
+        }
+    }
+
+    #[tool(
+        description = "Remove ALL installed Compact compiler versions. Destructive and \
+                          irreversible; a subsequent compile must re-download a compiler."
+    )]
+    async fn toolchain_clean(&self) -> Result<CallToolResult, McpError> {
+        match self.toolchain.clean().await {
+            Ok(raw) => Ok(Self::json_result(json!({ "raw": raw.trim() }), false)),
             Err(e) => Ok(Self::json_result(json!({ "error": e.to_string() }), true)),
         }
     }

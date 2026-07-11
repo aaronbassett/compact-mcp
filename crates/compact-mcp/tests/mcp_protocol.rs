@@ -992,3 +992,44 @@ async fn versions_tool_reports_both_parsers_and_a_skew_verdict() {
     }
     client.cancel().await.unwrap();
 }
+
+async fn tool_names(server: compact_mcp::server::CompactMcp) -> Vec<String> {
+    let (client_t, server_t) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        let _ = server
+            .serve(server_t)
+            .await
+            .expect("server failed to start")
+            .waiting()
+            .await;
+    });
+    let client = ().serve(client_t).await.unwrap();
+    let names = client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    client.cancel().await.unwrap();
+    names
+}
+
+#[tokio::test]
+async fn mutating_tools_are_hidden_unless_explicitly_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = compact_mcp_core::Workspace::new(dir.path()).unwrap();
+
+    let locked = tool_names(compact_mcp::server::CompactMcp::new(ws.clone())).await;
+    assert!(!locked.contains(&"toolchain_update".to_string()));
+    assert!(!locked.contains(&"toolchain_clean".to_string()));
+    assert!(
+        locked.contains(&"toolchain_list".to_string()),
+        "read-only tools stay visible"
+    );
+
+    let unlocked =
+        tool_names(compact_mcp::server::CompactMcp::new(ws).with_toolchain_mutation(true)).await;
+    assert!(unlocked.contains(&"toolchain_update".to_string()));
+    assert!(unlocked.contains(&"toolchain_clean".to_string()));
+}

@@ -81,6 +81,15 @@ impl CompactMcp {
         Self::new(workspace).with_advertise_task_list(false)
     }
 
+    /// Registers `toolchain_update` / `toolchain_clean`. Off by default: over HTTP
+    /// these are remote "install a binary" and "delete every compiler" primitives.
+    pub fn with_toolchain_mutation(mut self, allow: bool) -> Self {
+        if allow {
+            self.tool_router = self.tool_router.clone() + Self::mutation_router();
+        }
+        self
+    }
+
     /// The task's cancel token when running inside `enqueue_task`'s scope, else a
     /// fresh (never-cancelled) token for a plain synchronous tool call.
     pub(crate) fn current_cancel_token(&self) -> tokio_util::sync::CancellationToken {

@@ -17,7 +17,8 @@ async fn main() -> anyhow::Result<()> {
         config::Transport::Stdio => server::CompactMcp::new(workspace),
         config::Transport::Http => server::CompactMcp::new_http(workspace),
     }
-    .with_config(&config);
+    .with_config(&config)
+    .with_toolchain_mutation(config.allow_toolchain_mutation);
 
     let gc = server.tasks();
     tokio::spawn(async move {

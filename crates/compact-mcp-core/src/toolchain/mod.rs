@@ -128,6 +128,21 @@ impl Toolchain {
             _ => format!("{}{}", out.stdout, out.stderr),
         })
     }
+
+    /// Downloads and installs a compiler. Network + filesystem side effects.
+    pub async fn update(&self, version: Option<&str>) -> Result<String, CoreError> {
+        let out = match version {
+            Some(v) => self.run_checked(&["update", v]).await?,
+            None => self.run_checked(&["update"]).await?,
+        };
+        Ok(format!("{}{}", out.stdout, out.stderr))
+    }
+
+    /// Removes every installed compiler version. Destructive.
+    pub async fn clean(&self) -> Result<String, CoreError> {
+        let out = self.run_checked(&["clean"]).await?;
+        Ok(format!("{}{}", out.stdout, out.stderr))
+    }
 }
 
 #[cfg(test)]
