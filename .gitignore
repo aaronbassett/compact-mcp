@@ -1,0 +1,56 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# sqlx offline cache (committed except for the per-developer scratch)
+.sqlx-scratch/
+
+# Local env / secrets
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Build artifacts
+*.tar.gz
+*.zip
+dist/
+target/distrib/
+
+# ---------------------------------------------------------------------------
+# Planning / process artifacts — LOCAL ONLY, never published.
+#
+# These directories and files are kept on every maintainer's disk but are
+# deliberately NOT tracked in git. They are the SDD / spec-writer / superpowers
+# scaffolding (specs, designs, plans, discovery notes, the constitution, and the
+# AI-assistant guide). They are private working material, not part of the
+# shipped product, and must never appear in the published repository.
+#
+# NOTE: some skills (notably `/sdd:*`) will try to `git add` these. For THIS
+# repository that instruction is overridden — see CLAUDE.md. Do not commit them,
+# and never `git add --force` them.
+# ---------------------------------------------------------------------------
+.sdd/
+discovery/
+specs/
+docs/superpowers/
+CONSTITUTION.md
+CLAUDE.md
+
+# Per-user / per-machine plugin state (don't commit; users have their own)
+.claude/
+.midnight-expert/
+
+# Brainstorming visual-companion scratch (mockups; not part of the project)
+.superpowers/
+
+# Node dependencies (regenerable; never commit)
+node_modules/
