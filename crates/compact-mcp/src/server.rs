@@ -75,6 +75,12 @@ impl CompactMcp {
         self
     }
 
+    /// Like [`new`](Self::new) but for the HTTP transport, which cannot identify
+    /// requestors and so must not advertise `tasks/list`.
+    pub fn new_http(workspace: Workspace) -> Self {
+        Self::new(workspace).with_advertise_task_list(false)
+    }
+
     /// The task's cancel token when running inside `enqueue_task`'s scope, else a
     /// fresh (never-cancelled) token for a plain synchronous tool call.
     pub(crate) fn current_cancel_token(&self) -> tokio_util::sync::CancellationToken {

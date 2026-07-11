@@ -13,7 +13,11 @@ async fn main() -> anyhow::Result<()> {
 
     let config = config::Config::parse();
     let workspace = Workspace::new(config.resolved_workspace_root()?)?;
-    let server = server::CompactMcp::new(workspace).with_config(&config);
+    let server = match config.transport {
+        config::Transport::Stdio => server::CompactMcp::new(workspace),
+        config::Transport::Http => server::CompactMcp::new_http(workspace),
+    }
+    .with_config(&config);
 
     let gc = server.tasks();
     tokio::spawn(async move {
@@ -29,6 +33,10 @@ async fn main() -> anyhow::Result<()> {
 
     match config.transport {
         config::Transport::Stdio => transport::stdio::run(server).await,
-        config::Transport::Http => anyhow::bail!("http transport lands in Task 23"),
+        config::Transport::Http => {
+            let addr: std::net::SocketAddr = config.bind.parse()?;
+            transport::http::bind_guard(&addr, config.allow_insecure_bind)?;
+            transport::http::run(server, addr).await
+        }
     }
 }
