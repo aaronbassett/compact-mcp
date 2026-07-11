@@ -33,7 +33,7 @@ pub async fn run(server: CompactMcp, bind: SocketAddr, allow_insecure: bool) -> 
             format!("http://127.0.0.1:{}", bind.port()),
             format!("http://localhost:{}", bind.port()),
         ]);
-    let config = if allow_insecure {
+    let config = if allow_insecure && !bind.ip().is_loopback() {
         // A deliberately public bind (0.0.0.0) is reached by remote clients under
         // whatever address they dialed, NOT the bind literal — so a loopback-only
         // Host allow-list would 403 every legitimate remote request. The operator
