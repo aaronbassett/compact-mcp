@@ -85,7 +85,7 @@ impl CompactMcp {
     /// these are remote "install a binary" and "delete every compiler" primitives.
     pub fn with_toolchain_mutation(mut self, allow: bool) -> Self {
         if allow {
-            self.tool_router = self.tool_router.clone() + Self::mutation_router();
+            self.tool_router += Self::mutation_router();
         }
         self
     }

@@ -34,7 +34,10 @@ pub struct Config {
     #[arg(long)]
     pub allow_insecure_bind: bool,
 
-    /// Required by `toolchain_update` and `toolchain_clean`.
+    /// Register the destructive `toolchain_update` (installs a compiler binary)
+    /// and `toolchain_clean` (deletes ALL installed compilers) tools. Off by
+    /// default — over HTTP these are remote "install a binary" / "wipe the
+    /// toolchain" primitives an agent should not reach unless you opt in.
     #[arg(long)]
     pub allow_toolchain_mutation: bool,
 

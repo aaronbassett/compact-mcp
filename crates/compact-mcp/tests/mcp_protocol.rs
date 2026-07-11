@@ -1033,3 +1033,34 @@ async fn mutating_tools_are_hidden_unless_explicitly_enabled() {
     assert!(unlocked.contains(&"toolchain_update".to_string()));
     assert!(unlocked.contains(&"toolchain_clean".to_string()));
 }
+
+#[tokio::test]
+async fn a_hidden_mutation_tool_cannot_be_called_not_just_unlisted() {
+    // Defense in depth: `tools/call` dispatches through the SAME router as
+    // `tools/list`, so an un-merged mutation tool must be genuinely unreachable —
+    // not merely absent from the list. Guards a future refactor that decouples
+    // what is listed from what is routed.
+    let dir = tempfile::tempdir().unwrap();
+    let ws = compact_mcp_core::Workspace::new(dir.path()).unwrap();
+
+    let (client_t, server_t) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        let _ = compact_mcp::server::CompactMcp::new(ws)
+            .serve(server_t)
+            .await
+            .expect("server failed to start")
+            .waiting()
+            .await;
+    });
+    let client = ().serve(client_t).await.unwrap();
+
+    let res = client
+        .call_tool(CallToolRequestParams::new("toolchain_update"))
+        .await;
+    assert!(
+        res.is_err(),
+        "an un-registered mutation tool must be refused at the router, got {res:?}"
+    );
+
+    client.cancel().await.unwrap();
+}

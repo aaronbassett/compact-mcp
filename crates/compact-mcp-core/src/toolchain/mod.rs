@@ -120,28 +120,41 @@ impl Toolchain {
 
     pub async fn check(&self) -> Result<String, CoreError> {
         let out = self.run_checked(&["check"]).await?;
-        // `compact check` reports its verdict on stdout and exits 0; stderr is
-        // usually empty. Join with a newline only when both are non-empty so
-        // the two streams never run together on one line.
-        Ok(match (out.stdout.is_empty(), out.stderr.is_empty()) {
-            (false, false) => format!("{}\n{}", out.stdout, out.stderr),
-            _ => format!("{}{}", out.stdout, out.stderr),
-        })
+        Ok(joined_output(&out))
     }
 
     /// Downloads and installs a compiler. Network + filesystem side effects.
     pub async fn update(&self, version: Option<&str>) -> Result<String, CoreError> {
+        // A version is passed straight to `compact` as an argv token. Reject a
+        // non-version value (e.g. a flag like `--foo`) before it can steer the
+        // subprocess — defense in depth even though the tool is operator-gated.
+        // `None` means "latest".
+        if let Some(v) = version {
+            semver::Version::parse(v).map_err(|_| {
+                CoreError::InvalidArgs(format!("not a valid compiler version: {v}"))
+            })?;
+        }
         let out = match version {
             Some(v) => self.run_checked(&["update", v]).await?,
             None => self.run_checked(&["update"]).await?,
         };
-        Ok(format!("{}{}", out.stdout, out.stderr))
+        Ok(joined_output(&out))
     }
 
     /// Removes every installed compiler version. Destructive.
     pub async fn clean(&self) -> Result<String, CoreError> {
         let out = self.run_checked(&["clean"]).await?;
-        Ok(format!("{}{}", out.stdout, out.stderr))
+        Ok(joined_output(&out))
+    }
+}
+
+/// Join a finished command's stdout and stderr for display, with a newline
+/// between them only when both are non-empty — so a stdout line without a
+/// trailing newline never runs straight into the first stderr line.
+fn joined_output(out: &Output) -> String {
+    match (out.stdout.is_empty(), out.stderr.is_empty()) {
+        (false, false) => format!("{}\n{}", out.stdout, out.stderr),
+        _ => format!("{}{}", out.stdout, out.stderr),
     }
 }
 

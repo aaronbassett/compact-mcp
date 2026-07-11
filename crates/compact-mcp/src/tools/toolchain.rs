@@ -93,7 +93,8 @@ impl CompactMcp {
 impl CompactMcp {
     #[tool(
         description = "Install or update the Compact compiler. Downloads a binary and \
-                          writes to the toolchain directory."
+                          writes to the toolchain directory.",
+        annotations(destructive_hint = true, idempotent_hint = false)
     )]
     async fn toolchain_update(
         &self,
@@ -107,7 +108,8 @@ impl CompactMcp {
 
     #[tool(
         description = "Remove ALL installed Compact compiler versions. Destructive and \
-                          irreversible; a subsequent compile must re-download a compiler."
+                          irreversible; a subsequent compile must re-download a compiler.",
+        annotations(destructive_hint = true, idempotent_hint = true)
     )]
     async fn toolchain_clean(&self) -> Result<CallToolResult, McpError> {
         match self.toolchain.clean().await {
