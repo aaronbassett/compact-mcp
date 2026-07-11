@@ -1,0 +1,31 @@
+---
+source: crates/compact-mcp-core/tests/snapshots.rs
+expression: "analyze::diagnostics(\"ledger count Field;\", \"a.compact\", None)"
+---
+{
+  "success": false,
+  "error_count": 1,
+  "truncated": false,
+  "diagnostics": [
+    {
+      "severity": "error",
+      "source": "compactp",
+      "message": "expected COLON",
+      "file": "a.compact",
+      "span": {
+        "start": {
+          "offset": 12,
+          "line": 1,
+          "column": 13
+        },
+        "end": {
+          "offset": 12,
+          "line": 1,
+          "column": 13
+        }
+      },
+      "code": "E1",
+      "raw": false
+    }
+  ]
+}

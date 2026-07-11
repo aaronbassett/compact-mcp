@@ -1,0 +1,12 @@
+---
+source: crates/compact-mcp-core/tests/snapshots.rs
+expression: "analyze::stats(SRC)"
+---
+{
+  "file_size_bytes": 337,
+  "token_count": 133,
+  "node_count": 37,
+  "error_count": 0,
+  "recovery_count": 0,
+  "parse_time_ms": "[elapsed]"
+}

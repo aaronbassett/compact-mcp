@@ -1,0 +1,14 @@
+---
+source: crates/compact-mcp-core/tests/snapshots.rs
+expression: "artifacts::scaffold::witnesses_ts(&info)"
+---
+import type { Witnesses } from './contract/index.js';
+
+export type PrivateState = Record<string, never>;
+
+export const witnesses: Witnesses<PrivateState> = {
+  // lookup(context: WitnessContext<Ledger, PrivateState>, key_0: Uint8Array, idx_0: bigint): [PrivateState, bigint]
+  lookup(context, key_0, idx_0) {
+    throw new Error('witness `lookup` is not implemented');
+  },
+};

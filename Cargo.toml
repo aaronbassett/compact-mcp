@@ -41,6 +41,6 @@ tracing    = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid       = { version = "1", features = ["v4"] }
 
-insta    = "1.46"
+insta    = { version = "1.46", features = ["json", "redactions"] }
 proptest = "1"
 tempfile = "3"

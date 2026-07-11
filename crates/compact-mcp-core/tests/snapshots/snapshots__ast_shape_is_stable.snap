@@ -1,0 +1,51 @@
+---
+source: crates/compact-mcp-core/tests/snapshots.rs
+expression: "analyze::ast_json(SRC)"
+---
+{
+  "items": [
+    {
+      "detail": null,
+      "exported": true,
+      "kind": "Ledger",
+      "name": "round"
+    },
+    {
+      "detail": "sealed",
+      "exported": false,
+      "kind": "Ledger",
+      "name": "owner"
+    },
+    {
+      "detail": null,
+      "exported": false,
+      "kind": "Witness",
+      "name": "secret_value"
+    },
+    {
+      "detail": "pure",
+      "exported": true,
+      "kind": "Circuit",
+      "name": "double"
+    },
+    {
+      "detail": null,
+      "exported": true,
+      "kind": "Circuit",
+      "name": "increment"
+    },
+    {
+      "detail": null,
+      "exported": false,
+      "kind": "Struct",
+      "name": "Point"
+    },
+    {
+      "detail": null,
+      "exported": false,
+      "kind": "Enum",
+      "name": "Colour"
+    }
+  ],
+  "kind": "SourceFile"
+}

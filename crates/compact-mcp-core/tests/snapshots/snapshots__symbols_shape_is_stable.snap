@@ -1,0 +1,43 @@
+---
+source: crates/compact-mcp-core/tests/snapshots.rs
+expression: "analyze::symbols(SRC)"
+---
+[
+  {
+    "kind": "Ledger",
+    "name": "round",
+    "exported": true
+  },
+  {
+    "kind": "Ledger",
+    "name": "owner",
+    "exported": false,
+    "detail": "sealed"
+  },
+  {
+    "kind": "Witness",
+    "name": "secret_value",
+    "exported": false
+  },
+  {
+    "kind": "Circuit",
+    "name": "double",
+    "exported": true,
+    "detail": "pure"
+  },
+  {
+    "kind": "Circuit",
+    "name": "increment",
+    "exported": true
+  },
+  {
+    "kind": "Struct",
+    "name": "Point",
+    "exported": false
+  },
+  {
+    "kind": "Enum",
+    "name": "Colour",
+    "exported": false
+  }
+]

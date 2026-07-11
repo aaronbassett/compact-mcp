@@ -1,0 +1,14 @@
+---
+source: crates/compact-mcp-core/tests/snapshots.rs
+expression: "artifacts::zkir::stats(\"increment\", &p).unwrap()"
+---
+{
+  "circuit": "increment",
+  "instruction_count": 2,
+  "num_inputs": 0,
+  "version": "2.0",
+  "opcodes": {
+    "add": 1,
+    "load_imm": 1
+  }
+}
