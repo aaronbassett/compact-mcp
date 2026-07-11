@@ -256,6 +256,30 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn http_refuses_list_tasks_at_the_method_level_not_just_the_advertisement() {
+        // Defense in depth: withholding `tasks/list` from the HTTP capability is
+        // only half of it — the METHOD itself must refuse too, so a client that
+        // calls it anyway (ignoring the advertisement) can't enumerate task ids
+        // on a transport that can't identify requestors. Guards against a future
+        // refactor silently re-enabling it. stdio still answers it.
+        let d = tempfile::tempdir().unwrap();
+        let ws = compact_mcp_core::Workspace::new(d.path()).unwrap();
+
+        assert!(
+            CompactMcp::new(ws.clone())
+                .list_tasks_impl(None)
+                .await
+                .is_ok()
+        );
+
+        let err = CompactMcp::new_http(ws)
+            .list_tasks_impl(None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::METHOD_NOT_FOUND);
+    }
+
     #[test]
     fn rejects_both_path_and_source() {
         let (_d, s) = server();

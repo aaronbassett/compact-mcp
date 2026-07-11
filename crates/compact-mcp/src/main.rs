@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
         config::Transport::Http => {
             let addr: std::net::SocketAddr = config.bind.parse()?;
             transport::http::bind_guard(&addr, config.allow_insecure_bind)?;
-            transport::http::run(server, addr).await
+            transport::http::run(server, addr, config.allow_insecure_bind).await
         }
     }
 }
