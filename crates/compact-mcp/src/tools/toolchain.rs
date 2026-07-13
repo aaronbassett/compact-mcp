@@ -59,6 +59,14 @@ impl CompactMcp {
         // so we surface it as a successful call with `isError: true`, matching
         // the analysis tools. `McpError` stays reserved for bad request shapes.
         let ct = self.current_cancel_token();
+        // Gate: `versions` shells out up to FIVE times per call. One permit held
+        // across the whole sequence bounds it to a single concurrent `compact`
+        // process (never five) and counts it against the same global build
+        // ceiling as `compile` — this path was previously ungated.
+        let _permit = match self.acquire_gate(&ct).await {
+            Ok(p) => p,
+            Err(e) => return Ok(Self::json_result(json!({ "error": e.to_string() }), true)),
+        };
         match self.toolchain.versions(&ct).await {
             Ok(v) => Ok(Self::json_result(serde_json::to_value(v).unwrap(), false)),
             Err(e) => Ok(Self::json_result(json!({ "error": e.to_string() }), true)),
@@ -68,6 +76,12 @@ impl CompactMcp {
     #[tool(description = "List Compact compiler versions available to the toolchain.")]
     async fn toolchain_list(&self) -> Result<CallToolResult, McpError> {
         let ct = self.current_cancel_token();
+        // Gate: `toolchain_list` spawns `compact list` — same global build gate
+        // as `compile` (previously ungated).
+        let _permit = match self.acquire_gate(&ct).await {
+            Ok(p) => p,
+            Err(e) => return Ok(Self::json_result(json!({ "error": e.to_string() }), true)),
+        };
         match self.toolchain.list(&ct).await {
             Ok(out) => Ok(Self::json_result(
                 json!({ "versions": parse_list(&out), "raw": out }),
@@ -82,6 +96,12 @@ impl CompactMcp {
     )]
     async fn toolchain_check(&self) -> Result<CallToolResult, McpError> {
         let ct = self.current_cancel_token();
+        // Gate: `toolchain_check` spawns `compact check` (network I/O) — same
+        // global build gate as `compile` (previously ungated).
+        let _permit = match self.acquire_gate(&ct).await {
+            Ok(p) => p,
+            Err(e) => return Ok(Self::json_result(json!({ "error": e.to_string() }), true)),
+        };
         match self.toolchain.check(&ct).await {
             Ok(out) => Ok(Self::json_result(
                 json!({ "up_to_date": out.contains("Up to date"), "raw": out }),
@@ -104,6 +124,13 @@ impl CompactMcp {
         Parameters(args): Parameters<UpdateArgs>,
     ) -> Result<CallToolResult, McpError> {
         let ct = self.current_cancel_token();
+        // Gate: `toolchain_update` spawns `compact update` (downloads a binary).
+        // Operator-gated and off by default, but still routed through the one
+        // global build gate so "every compiler subprocess" really means every one.
+        let _permit = match self.acquire_gate(&ct).await {
+            Ok(p) => p,
+            Err(e) => return Ok(Self::json_result(json!({ "error": e.to_string() }), true)),
+        };
         match self.toolchain.update(args.version.as_deref(), &ct).await {
             Ok(raw) => Ok(Self::json_result(json!({ "raw": raw.trim() }), false)),
             Err(e) => Ok(Self::json_result(json!({ "error": e.to_string() }), true)),
@@ -117,6 +144,13 @@ impl CompactMcp {
     )]
     async fn toolchain_clean(&self) -> Result<CallToolResult, McpError> {
         let ct = self.current_cancel_token();
+        // Gate: `toolchain_clean` spawns `compact clean` — same global build gate
+        // (operator-gated, off by default, but routed through the gate for
+        // completeness).
+        let _permit = match self.acquire_gate(&ct).await {
+            Ok(p) => p,
+            Err(e) => return Ok(Self::json_result(json!({ "error": e.to_string() }), true)),
+        };
         match self.toolchain.clean(&ct).await {
             Ok(raw) => Ok(Self::json_result(json!({ "raw": raw.trim() }), false)),
             Err(e) => Ok(Self::json_result(json!({ "error": e.to_string() }), true)),

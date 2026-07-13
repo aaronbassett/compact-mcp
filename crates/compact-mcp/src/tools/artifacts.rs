@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use compact_mcp_core::CoreError;
 use compact_mcp_core::artifacts::{self, Artifacts};
 use rmcp::{
@@ -183,13 +185,18 @@ impl CompactMcp {
             no_communications_commitment: false,
             source_root: None,
         };
+        // `witness_scaffold` runs a full (--skip-zk) compile, so it MUST count
+        // against the same global build ceiling as `compile` — previously this
+        // spawned `compact` UNGATED. Hold one permit for the whole compile.
+        // Thread the REAL request/task cancel token through (it was a fresh,
+        // never-cancelled `CancellationToken::new()`, making the build
+        // uncancellable and deaf to `notifications/cancelled`) and use the
+        // configured `compile_timeout_secs` (it was a hardcoded 300s).
+        let ct = self.current_cancel_token();
+        let _permit = self.acquire_gate(&ct).await?;
         let out = self
             .toolchain
-            .compile(
-                &req,
-                tokio_util::sync::CancellationToken::new(),
-                std::time::Duration::from_secs(300),
-            )
+            .compile(&req, ct, Duration::from_secs(self.compile_timeout_secs))
             .await?;
 
         if !out.ok {

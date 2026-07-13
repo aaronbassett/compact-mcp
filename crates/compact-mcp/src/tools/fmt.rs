@@ -53,6 +53,20 @@ impl CompactMcp {
         // tools. `McpError` stays reserved for bad request shapes (the XOR check
         // above).
         let ct = self.current_cancel_token();
+        // Gate: `format` spawns a `compact format` subprocess, so it takes a
+        // permit from the same global build gate as `compile` (this path was
+        // previously ungated). Held for the whole subprocess run; a full queue or
+        // a cancel is a CoreError surfaced as isError, matching the
+        // toolchain-failure path below.
+        let _permit = match self.acquire_gate(&ct).await {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(Self::json_result(
+                    serde_json::json!({ "error": e.to_string() }),
+                    true,
+                ));
+            }
+        };
         match self
             .toolchain
             .format(&self.workspace, input, args.write, &ct)
@@ -82,6 +96,17 @@ impl CompactMcp {
         Parameters(args): Parameters<FixupArgs>,
     ) -> Result<CallToolResult, McpError> {
         let ct = self.current_cancel_token();
+        // Gate: `fixup` spawns a `compact fixup` subprocess — same global build
+        // gate as `compile` (this path was previously ungated).
+        let _permit = match self.acquire_gate(&ct).await {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(Self::json_result(
+                    serde_json::json!({ "error": e.to_string() }),
+                    true,
+                ));
+            }
+        };
         match self
             .toolchain
             .fixup(&self.workspace, &args.path, args.write, &ct)
