@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use compact_mcp_core::jobs::{BuildGate, TaskStore};
-use compact_mcp_core::{Toolchain, Workspace};
+use compact_mcp_core::{CoreError, Toolchain, Workspace};
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::router::tool::ToolRouter,
@@ -14,6 +14,8 @@ use rmcp::{
     service::RequestContext,
     tool_handler,
 };
+use tokio::sync::OwnedSemaphorePermit;
+use tokio_util::sync::CancellationToken;
 
 tokio::task_local! {
     pub(crate) static TASK_CANCEL: tokio_util::sync::CancellationToken;
@@ -102,6 +104,35 @@ impl CompactMcp {
     /// fresh (never-cancelled) token for a plain synchronous tool call.
     pub(crate) fn current_cancel_token(&self) -> tokio_util::sync::CancellationToken {
         TASK_CANCEL.try_with(|t| t.clone()).unwrap_or_default()
+    }
+
+    /// Acquire a permit from the shared [`BuildGate`] before spawning ANY
+    /// `compact` subprocess, releasing it (RAII) when the returned permit drops
+    /// on completion or cancel.
+    ///
+    /// Every compiler-spawning tool takes its permit from this ONE gate — the
+    /// heavy `compile`/`witness_scaffold` builds AND the lighter `format`/
+    /// `fixup`/`versions`/`toolchain_list`/`toolchain_check`/`toolchain_update`/
+    /// `toolchain_clean` probes — so `max_concurrent_builds` is a real GLOBAL
+    /// ceiling on concurrent `compact` processes rather than a per-`compile`
+    /// limit. A call holds its single permit for the WHOLE operation (e.g.
+    /// `versions`, which shells out up to five times, runs them serially under
+    /// one permit — never five), so the gate can never be double-acquired within
+    /// one handler.
+    ///
+    /// `biased`: check cancellation FIRST so a call cancelled WHILE QUEUED frees
+    /// its slot at once — dropping the `acquire` future runs the gate's
+    /// queue-counter guard — instead of holding it until its turn finally comes
+    /// up. A fresh sync-call token never fires this branch.
+    pub(crate) async fn acquire_gate(
+        &self,
+        ct: &CancellationToken,
+    ) -> Result<OwnedSemaphorePermit, CoreError> {
+        tokio::select! {
+            biased;
+            _ = ct.cancelled() => Err(CoreError::Cancelled),
+            p = self.gate.acquire() => p,
+        }
     }
 
     /// The shared task registry, for wiring up the retention GC loop from
