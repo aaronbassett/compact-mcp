@@ -29,6 +29,31 @@ fn ast_shape_is_stable() {
     insta::assert_json_snapshot!(analyze::ast_json(SRC));
 }
 
+// Exercises the two omission fixes (issue #5): declarations nested in a `module { … }`
+// block, and the `export { … }` list form (both an inline top-level list and a
+// module-scoped one). Locks that nested members are listed with a `module` path and
+// that list-exported declarations report `exported: true`.
+const NESTED_SRC: &str = "pragma language_version >= 0.23;\n\
+                          witness top_secret(): Field;\n\
+                          circuit top_run(): [] {}\n\
+                          export { top_run };\n\
+                          module Vault {\n\
+                            export ledger balance: Counter;\n\
+                            witness key(): Field;\n\
+                            circuit spend(): [] {}\n\
+                            export { key };\n\
+                          }\n";
+
+#[test]
+fn symbols_module_and_export_list_shape_is_stable() {
+    insta::assert_json_snapshot!(analyze::symbols(NESTED_SRC));
+}
+
+#[test]
+fn ast_module_and_export_list_shape_is_stable() {
+    insta::assert_json_snapshot!(analyze::ast_json(NESTED_SRC));
+}
+
 #[test]
 fn stats_shape_is_stable() {
     insta::assert_json_snapshot!(analyze::stats(SRC), { ".parse_time_ms" => "[elapsed]" });

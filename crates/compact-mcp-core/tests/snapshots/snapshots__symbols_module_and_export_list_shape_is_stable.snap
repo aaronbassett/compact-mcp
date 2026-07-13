@@ -1,0 +1,39 @@
+---
+source: crates/compact-mcp-core/tests/snapshots.rs
+expression: "analyze::symbols(NESTED_SRC)"
+---
+[
+  {
+    "kind": "Witness",
+    "name": "top_secret",
+    "exported": false
+  },
+  {
+    "kind": "Circuit",
+    "name": "top_run",
+    "exported": true
+  },
+  {
+    "kind": "Module",
+    "name": "Vault",
+    "exported": false
+  },
+  {
+    "kind": "Ledger",
+    "name": "balance",
+    "exported": true,
+    "module": "Vault"
+  },
+  {
+    "kind": "Witness",
+    "name": "key",
+    "exported": true,
+    "module": "Vault"
+  },
+  {
+    "kind": "Circuit",
+    "name": "spend",
+    "exported": false,
+    "module": "Vault"
+  }
+]

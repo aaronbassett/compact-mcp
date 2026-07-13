@@ -1,0 +1,48 @@
+---
+source: crates/compact-mcp-core/tests/snapshots.rs
+expression: "analyze::ast_json(NESTED_SRC)"
+---
+{
+  "items": [
+    {
+      "detail": null,
+      "exported": false,
+      "kind": "Witness",
+      "name": "top_secret"
+    },
+    {
+      "detail": null,
+      "exported": true,
+      "kind": "Circuit",
+      "name": "top_run"
+    },
+    {
+      "detail": null,
+      "exported": false,
+      "kind": "Module",
+      "name": "Vault"
+    },
+    {
+      "detail": null,
+      "exported": true,
+      "kind": "Ledger",
+      "module": "Vault",
+      "name": "balance"
+    },
+    {
+      "detail": null,
+      "exported": true,
+      "kind": "Witness",
+      "module": "Vault",
+      "name": "key"
+    },
+    {
+      "detail": null,
+      "exported": false,
+      "kind": "Circuit",
+      "module": "Vault",
+      "name": "spend"
+    }
+  ],
+  "kind": "SourceFile"
+}
