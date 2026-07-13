@@ -76,11 +76,19 @@ impl Toolchain {
             other => other,
         })?;
         let pid = child.id().unwrap_or(0);
+        // Reap the whole process GROUP if THIS future is dropped before any arm
+        // resolves (e.g. an HTTP client disconnects mid-build). `spawn_group`'s
+        // `kill_on_drop` reaps only the direct child, orphaning the forked
+        // `compactc.bin`; this guard closes that gap. Each arm below reaps
+        // explicitly (cancel/timeout) or sees the child already exit (success), so
+        // each disarms the guard to avoid a double kill.
+        let mut reaper = proc::KillGroupOnDrop::new(pid);
 
         let output = tokio::select! {
             biased;
 
             _ = ct.cancelled() => {
+                reaper.disarm();
                 // `child` is moved into the `wait_with_output` branch below when
                 // `select!` eagerly constructs all branch futures, so it cannot be
                 // referenced here. `kill_group` reaches the whole process tree via
@@ -111,6 +119,7 @@ impl Toolchain {
                 return Err(CoreError::Cancelled);
             }
             _ = tokio::time::sleep(timeout) => {
+                reaper.disarm();
                 if pid != 0 {
                     // Off the async worker, and awaited so the gate permit is held
                     // until the kill completes — see the cancel branch above.
@@ -118,7 +127,10 @@ impl Toolchain {
                 }
                 return Err(CoreError::Timeout(timeout));
             }
-            out = child.wait_with_output() => out?,
+            out = child.wait_with_output() => {
+                reaper.disarm();
+                out?
+            }
         };
 
         let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
