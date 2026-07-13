@@ -57,13 +57,13 @@ impl CompactMcp {
 
     /// Apply the CLI config. Called from `main`.
     pub fn with_config(mut self, c: &crate::config::Config) -> Self {
-        // Rebuild the toolchain so `--compact-bin` / `--compiler-version` (and
-        // their env vars) actually take effect. Without this both flags parse and
-        // validate but are dropped on the floor: the server keeps the default
-        // `Toolchain::new("compact", None)`, always shelling out to whatever
-        // `compact` is on `$PATH`, unpinned. `compiler_version` reaches
-        // `compact compile` as the leading `+VERSION` token via
-        // `Toolchain::compile`. Regression-guarded in this module's tests. (#1)
+        // Rebuild the toolchain so `--compact-bin` / `--compiler-version` actually
+        // take effect. Without this both flags are parsed but then dropped on the
+        // floor: the server keeps the default `Toolchain::new("compact", None)`,
+        // always shelling out to whatever `compact` is on `$PATH`, unpinned.
+        // `compiler_version` reaches `compact compile` as the leading `+VERSION`
+        // token via `Toolchain::compile`. Regression-guarded in this module's
+        // tests. (#1)
         self.toolchain = Toolchain::new(c.compact_bin.as_str(), c.compiler_version.clone());
         self.tasks = Arc::new(TaskStore::new(
             Duration::from_secs(c.default_task_ttl),
