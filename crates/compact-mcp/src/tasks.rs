@@ -75,7 +75,13 @@ impl CompactMcp {
             .as_ref()
             .and_then(|t| t.ttl)
             .map(Duration::from_millis);
-        let (id, cancel, _actual) = self.tasks.create(requested);
+        // The task registry enforces an admission cap; a full store is a
+        // resource-exhaustion guard, not a request-shape error, so surface it as
+        // an internal (retryable) error rather than `invalid_params`.
+        let (id, cancel, _actual) = self
+            .tasks
+            .create(requested)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let this = self.clone();
         let id2 = id.clone();

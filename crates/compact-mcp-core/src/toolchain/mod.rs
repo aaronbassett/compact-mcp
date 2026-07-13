@@ -21,6 +21,15 @@ use crate::CoreError;
 /// [`Toolchain::with_timeout`].
 const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Per-stream cap on captured subprocess output (16 MiB of stdout AND 16 MiB of
+/// stderr). Any `compact` invocation's real output — diagnostics, `list`,
+/// `check`, `update` progress — sits far below this; the cap exists only so a
+/// runaway or hostile subprocess (`256 MiB → ~1:1 RSS growth in <1s`) cannot
+/// exhaust memory through our capture buffer. Like [`DEFAULT_RUN_TIMEOUT`] it is
+/// an internal safety ceiling, not an operational knob, so it is a constant with
+/// a builder override ([`Toolchain::with_output_limit`]) rather than a CLI flag.
+const DEFAULT_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct Output {
     pub status: i32,
@@ -35,6 +44,7 @@ pub struct Toolchain {
     bin: String,
     compiler_version: Option<String>,
     timeout: Duration,
+    output_limit: usize,
 }
 
 impl Toolchain {
@@ -43,6 +53,7 @@ impl Toolchain {
             bin: bin.into(),
             compiler_version,
             timeout: DEFAULT_RUN_TIMEOUT,
+            output_limit: DEFAULT_OUTPUT_LIMIT,
         }
     }
 
@@ -51,6 +62,15 @@ impl Toolchain {
     /// the heavy `compile` path takes its own timeout per request.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Override the per-stream captured-output cap (default
+    /// [`DEFAULT_OUTPUT_LIMIT`]). Applies to both `run` and `compile`; output
+    /// past the cap is drained and discarded with a truncation marker, never
+    /// buffered.
+    pub fn with_output_limit(mut self, limit: usize) -> Self {
+        self.output_limit = limit;
         self
     }
 
@@ -118,7 +138,7 @@ impl Toolchain {
                 }
                 return Err(CoreError::Timeout(self.timeout));
             }
-            out = child.wait_with_output() => {
+            out = proc::wait_with_capped_output(child, self.output_limit) => {
                 reaper.disarm();
                 out?
             }
@@ -126,8 +146,16 @@ impl Toolchain {
 
         Ok(Output {
             status: output.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            stdout: proc::lossy_with_marker(
+                &output.stdout,
+                output.stdout_truncated,
+                self.output_limit,
+            ),
+            stderr: proc::lossy_with_marker(
+                &output.stderr,
+                output.stderr_truncated,
+                self.output_limit,
+            ),
         })
     }
 
@@ -301,6 +329,43 @@ mod tests {
         let out = tc.run(&["hello"], &CancellationToken::new()).await.unwrap();
         assert_eq!(out.status, 0);
         assert_eq!(out.stdout.trim(), "hello");
+    }
+
+    #[tokio::test]
+    async fn run_caps_subprocess_output_instead_of_buffering_it_whole() {
+        // A subprocess that writes far more than the cap must have its captured
+        // stdout TRUNCATED (bounded memory) with a marker, not buffered whole.
+        // Hermetic: `yes` piped through `head -c` emits a fixed, large byte
+        // count and needs no `compact` binary.
+        let tc = Toolchain::new("sh", None).with_output_limit(64);
+        let out = tc
+            .run(
+                &["-c", "yes abcdefgh | head -c 200000"],
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.status, 0);
+        assert!(
+            out.stdout.len() < 4096,
+            "captured stdout must be capped near the 64-byte limit, got {} bytes",
+            out.stdout.len()
+        );
+        assert!(
+            out.stdout.contains("truncated"),
+            "a truncated capture must carry the marker, got {:?}",
+            out.stdout
+        );
+    }
+
+    #[tokio::test]
+    async fn run_does_not_mark_within_limit_output_as_truncated() {
+        // Regression guard: output under the cap is returned verbatim with NO
+        // marker, so the cap never alters a normal (within-limit) capture.
+        let tc = Toolchain::new("echo", None).with_output_limit(64);
+        let out = tc.run(&["hello"], &CancellationToken::new()).await.unwrap();
+        assert_eq!(out.stdout.trim(), "hello");
+        assert!(!out.stdout.contains("truncated"), "got {:?}", out.stdout);
     }
 
     #[tokio::test]

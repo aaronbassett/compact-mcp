@@ -56,6 +56,20 @@ pub struct Config {
     #[arg(long, default_value = "3600")]
     pub max_task_ttl: u64,
 
+    /// Hard cap on the number of live task records. New tasks are rejected once
+    /// the registry is full, bounding memory (and the O(n) list/GC scans) rather
+    /// than relying on TTL eviction alone.
+    #[arg(long, default_value = "1024")]
+    pub max_tasks: usize,
+
+    /// Maximum HTTP request-body size in bytes (streamable-http transport only).
+    /// Must exceed the largest legitimate request, which embeds up to
+    /// `MAX_SOURCE_BYTES` of source plus JSON-RPC framing; the default is 4x the
+    /// source cap. Bodies larger than this are rejected with 413 before being
+    /// buffered.
+    #[arg(long, default_value_t = compact_mcp_core::MAX_SOURCE_BYTES * 4)]
+    pub max_http_body_bytes: usize,
+
     /// Pin the compiler, passed to `compact compile` as `+VERSION`.
     #[arg(long)]
     pub compiler_version: Option<String>,

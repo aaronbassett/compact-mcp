@@ -61,20 +61,38 @@ impl Record {
     }
 }
 
+/// True once `r` is terminal AND its retention window (measured from the
+/// terminal transition) has closed. A clock that ran backwards (`duration_since`
+/// error) is treated as not-yet-expired, matching `gc`'s prior behaviour.
+fn is_expired(r: &Record, now: SystemTime) -> bool {
+    r.state.is_terminal()
+        && now
+            .duration_since(r.last_updated_at)
+            .map(|age| age >= r.ttl)
+            .unwrap_or(false)
+}
+
 /// In-memory task registry. `ttl` is a RETENTION window (how long a finished
 /// task's result is kept), not an execution timeout — those are separate knobs.
 pub struct TaskStore {
     inner: Mutex<HashMap<String, Record>>,
     default_ttl: Duration,
     max_ttl: Duration,
+    /// Hard admission cap on the number of live records. Bounds map growth (and
+    /// the O(n) `list`/`gc` scans) so terminal records minted faster than the
+    /// TTL sweep reaps them can't grow the map without bound.
+    max_tasks: usize,
 }
 
 impl TaskStore {
-    pub fn new(default_ttl: Duration, max_ttl: Duration) -> Self {
+    pub fn new(default_ttl: Duration, max_ttl: Duration, max_tasks: usize) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
             default_ttl,
             max_ttl,
+            // A zero cap would reject every task; clamp to at least one so a
+            // misconfiguration degrades to "one at a time", never a dead server.
+            max_tasks: max_tasks.max(1),
         }
     }
 
@@ -84,14 +102,30 @@ impl TaskStore {
 
     /// Returns the id, the token the running future must observe, and the
     /// ACTUAL ttl — which the caller MUST report back to the client.
-    pub fn create(&self, requested_ttl: Option<Duration>) -> (String, CancellationToken, Duration) {
+    ///
+    /// Rejects with [`CoreError::TaskStoreFull`] once the live map is at
+    /// `max_tasks`. Before rejecting it opportunistically evicts any expired
+    /// terminal records, so a burst of short-lived tasks reclaims room the
+    /// periodic TTL GC hasn't swept yet rather than failing spuriously.
+    pub fn create(
+        &self,
+        requested_ttl: Option<Duration>,
+    ) -> Result<(String, CancellationToken, Duration), CoreError> {
         let id = uuid::Uuid::new_v4().to_string();
         let ttl = self.clamp(requested_ttl);
         let cancel = CancellationToken::new();
         let (state_tx, _) = watch::channel(TaskState::Working);
         let now = SystemTime::now();
 
-        self.inner.lock().unwrap().insert(
+        let mut g = self.inner.lock().unwrap();
+        // Only pay the O(n) sweep when we're actually at the cap.
+        if g.len() >= self.max_tasks {
+            g.retain(|_, r| !is_expired(r, now));
+        }
+        if g.len() >= self.max_tasks {
+            return Err(CoreError::TaskStoreFull(self.max_tasks));
+        }
+        g.insert(
             id.clone(),
             Record {
                 state: TaskState::Working,
@@ -104,7 +138,7 @@ impl TaskStore {
                 state_tx,
             },
         );
-        (id, cancel, ttl)
+        Ok((id, cancel, ttl))
     }
 
     pub fn set_status(&self, id: &str, msg: &str) {
@@ -214,13 +248,7 @@ impl TaskStore {
     pub fn gc(&self, now: SystemTime) -> usize {
         let mut g = self.inner.lock().unwrap();
         let before = g.len();
-        g.retain(|_, r| {
-            !r.state.is_terminal()
-                || now
-                    .duration_since(r.last_updated_at)
-                    .map(|age| age < r.ttl)
-                    .unwrap_or(true)
-        });
+        g.retain(|_, r| !is_expired(r, now));
         before - g.len()
     }
 }
@@ -231,19 +259,21 @@ mod tests {
     use serde_json::json;
 
     fn store() -> TaskStore {
-        TaskStore::new(Duration::from_secs(900), Duration::from_secs(3600))
+        // A cap well above every test's task count, so only the dedicated
+        // admission-cap tests below ever exercise the rejection path.
+        TaskStore::new(Duration::from_secs(900), Duration::from_secs(3600), 1024)
     }
 
     #[test]
     fn ttl_is_clamped_and_defaulted() {
         let s = store();
-        let (_, _, a) = s.create(None);
+        let (_, _, a) = s.create(None).unwrap();
         assert_eq!(a, Duration::from_secs(900), "omitted ttl uses the default");
 
-        let (_, _, b) = s.create(Some(Duration::from_secs(60)));
+        let (_, _, b) = s.create(Some(Duration::from_secs(60))).unwrap();
         assert_eq!(b, Duration::from_secs(60), "a reasonable ttl is honoured");
 
-        let (_, _, c) = s.create(Some(Duration::from_secs(999_999)));
+        let (_, _, c) = s.create(Some(Duration::from_secs(999_999))).unwrap();
         assert_eq!(
             c,
             Duration::from_secs(3600),
@@ -255,7 +285,7 @@ mod tests {
     fn result_is_not_consumed_by_reading_it() {
         // rmcp's default `take_completed_result` removes it; the spec allows re-fetch.
         let s = store();
-        let (id, _, _) = s.create(None);
+        let (id, _, _) = s.create(None).unwrap();
         s.finish(&id, json!({"ok": true}), false);
 
         assert_eq!(s.result(&id).unwrap().unwrap()["ok"], true);
@@ -269,7 +299,7 @@ mod tests {
     #[test]
     fn result_distinguishes_unknown_id_from_pending() {
         let s = store();
-        let (id, _, _) = s.create(None);
+        let (id, _, _) = s.create(None).unwrap();
         // A KNOWN but still-working task has no result payload -> Ok(None),
         // NOT the same error an unknown id gets. The caller must be able to tell
         // "no such task" from "not done yet".
@@ -281,7 +311,7 @@ mod tests {
     #[test]
     fn a_failed_call_tool_result_marks_the_task_failed() {
         let s = store();
-        let (id, _, _) = s.create(None);
+        let (id, _, _) = s.create(None).unwrap();
         s.finish(&id, json!({"isError": true}), true);
         assert_eq!(s.get(&id).unwrap().state, TaskState::Failed);
     }
@@ -289,7 +319,7 @@ mod tests {
     #[test]
     fn cancel_signals_the_token_and_is_idempotent_only_once() {
         let s = store();
-        let (id, ct, _) = s.create(None);
+        let (id, ct, _) = s.create(None).unwrap();
         assert!(!ct.is_cancelled());
 
         let snap = s.cancel(&id).unwrap();
@@ -303,7 +333,7 @@ mod tests {
     #[test]
     fn cancelling_a_completed_task_is_an_error() {
         let s = store();
-        let (id, _, _) = s.create(None);
+        let (id, _, _) = s.create(None).unwrap();
         s.finish(&id, json!({}), false);
         assert!(matches!(s.cancel(&id), Err(CoreError::TaskTerminal(_))));
     }
@@ -318,8 +348,8 @@ mod tests {
     #[test]
     fn gc_evicts_only_tasks_past_their_ttl() {
         let s = store();
-        let (short, _, _) = s.create(Some(Duration::from_secs(1)));
-        let (long, _, _) = s.create(Some(Duration::from_secs(3000)));
+        let (short, _, _) = s.create(Some(Duration::from_secs(1))).unwrap();
+        let (long, _, _) = s.create(Some(Duration::from_secs(3000))).unwrap();
         s.finish(&short, json!({}), false);
         s.finish(&long, json!({}), false);
 
@@ -332,7 +362,7 @@ mod tests {
     #[tokio::test]
     async fn subscribe_wakes_on_the_terminal_transition() {
         let s = store();
-        let (id, _, _) = s.create(None);
+        let (id, _, _) = s.create(None).unwrap();
         let mut rx = s.subscribe(&id).unwrap();
         assert!(!rx.borrow().is_terminal());
 
@@ -346,7 +376,7 @@ mod tests {
         // A subscriber that arrives AFTER the task finished still reads the
         // terminal state via `borrow()`, without needing a `changed()` wake.
         let s = store();
-        let (id, _, _) = s.create(None);
+        let (id, _, _) = s.create(None).unwrap();
         s.finish(&id, json!({}), false);
         let rx = s.subscribe(&id).unwrap();
         assert!(rx.borrow().is_terminal());
@@ -359,7 +389,7 @@ mod tests {
         // would orphan its running future and drop its cancel token. Retention
         // applies only to FINISHED results.
         let s = store();
-        let (id, _, _) = s.create(Some(Duration::from_secs(1)));
+        let (id, _, _) = s.create(Some(Duration::from_secs(1))).unwrap();
         let later = SystemTime::now() + Duration::from_secs(10);
         assert_eq!(s.gc(later), 0, "a Working task is never evicted by age");
         assert_eq!(s.get(&id).unwrap().state, TaskState::Working);
@@ -372,7 +402,7 @@ mod tests {
         // long run; if gc keyed off created_at (age 110s > 100s ttl) it would
         // wrongly evict, but keyed off last_updated_at (age ~20s) it is kept.
         let s = store();
-        let (id, _, _) = s.create(Some(Duration::from_secs(100)));
+        let (id, _, _) = s.create(Some(Duration::from_secs(100))).unwrap();
         s.inner.lock().unwrap().get_mut(&id).unwrap().created_at =
             SystemTime::now() - Duration::from_secs(90);
         s.finish(&id, json!({}), false); // last_updated_at = now
@@ -389,9 +419,71 @@ mod tests {
     fn task_ids_are_unguessable() {
         // No auth context exists on HTTP, so the id is the only secret.
         let s = store();
-        let (a, _, _) = s.create(None);
-        let (b, _, _) = s.create(None);
+        let (a, _, _) = s.create(None).unwrap();
+        let (b, _, _) = s.create(None).unwrap();
         assert_ne!(a, b);
         assert!(a.len() >= 32, "expected a uuid-length id, got {a:?}");
+    }
+
+    #[test]
+    fn create_rejects_once_the_task_map_is_full() {
+        // Admission cap: a full map rejects new creates instead of growing
+        // without bound (the OOM the TTL-only eviction allowed — 200k sequential
+        // creates, 0 rejected). All tasks here stay Working, so the opportunistic
+        // eviction can never reclaim a slot — this proves the HARD cap, not GC.
+        let s = TaskStore::new(Duration::from_secs(900), Duration::from_secs(3600), 3);
+        let _a = s.create(None).unwrap();
+        let _b = s.create(None).unwrap();
+        let _c = s.create(None).unwrap();
+        let err = s.create(None).unwrap_err();
+        assert!(
+            matches!(err, CoreError::TaskStoreFull(3)),
+            "a full store must reject, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn create_reclaims_expired_terminal_slots_under_pressure() {
+        // At the cap, a create first evicts EXPIRED TERMINAL records and then
+        // succeeds — so short-lived tasks recycle their slots rather than the
+        // cap wedging the store shut once it fills with stale results.
+        let s = TaskStore::new(Duration::from_secs(1), Duration::from_secs(3600), 1);
+        let (id, _, _) = s.create(None).unwrap();
+        s.finish(&id, json!({}), false);
+        // Backdate the finished task past its 1s retention window.
+        s.inner
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .last_updated_at = SystemTime::now() - Duration::from_secs(10);
+        // The map is full (1/1) but its sole record is expired-terminal, so the
+        // next create reclaims that slot and admits rather than rejecting.
+        let res = s.create(None);
+        assert!(
+            res.is_ok(),
+            "an expired terminal slot must be reclaimed under pressure: {res:?}"
+        );
+        // And the reclaimed id is gone.
+        assert!(matches!(s.get(&id), Err(CoreError::TaskNotFound(_))));
+    }
+
+    #[test]
+    fn create_does_not_evict_live_working_tasks_to_make_room() {
+        // Opportunistic eviction must never sacrifice a still-Working task to
+        // admit a new one: that would orphan a running future. A cap of 1 held by
+        // a Working task rejects the next create outright.
+        let s = TaskStore::new(Duration::from_secs(1), Duration::from_secs(3600), 1);
+        let (id, _, _) = s.create(None).unwrap();
+        // Backdate WAY past the ttl — a Working task is still never evicted.
+        s.inner
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .last_updated_at = SystemTime::now() - Duration::from_secs(10);
+        let err = s.create(None).unwrap_err();
+        assert!(matches!(err, CoreError::TaskStoreFull(1)), "got {err:?}");
+        assert_eq!(s.get(&id).unwrap().state, TaskState::Working);
     }
 }

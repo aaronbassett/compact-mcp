@@ -25,6 +25,10 @@ rmcp = { version = "2.2.0", features = [
 
 anyhow     = "1"
 axum       = "0.8"
+# `Limited` request-body wrapper for the HTTP transport's body-size cap. Already
+# in the tree transitively (via axum/hyper); named here so the http transport can
+# depend on it directly.
+http-body-util = "0.1"
 # Native binary only: drop chrono's default `wasmbind` (pulls wasm-bindgen/js-sys).
 # `std` covers `DateTime::<Utc>::from(SystemTime)` + `to_rfc3339()`.
 chrono     = { version = "0.4", default-features = false, features = ["std"] }
