@@ -121,6 +121,14 @@ impl Toolchain {
                     "`write: true` requires `path`, not `source`".into(),
                 ));
             };
+            // TOCTOU re-check (issue #9). `target` was vetted by `resolve` above,
+            // but `compact <subcommand>` — which performs the in-place rewrite —
+            // does not open it until we spawn it. Re-assert no symlink has been
+            // swapped into `target`'s existing prefix since; otherwise the
+            // rewrite could land outside the root. Residual: the compiler owns
+            // the actual open+write, so the spawn->open gap remains; this shrinks
+            // the window to that gap (see `assert_no_symlink_swap`).
+            ws.revalidate_before_write(&target)?;
             let out = self
                 .run(&[subcommand, &target.to_string_lossy()], ct)
                 .await?;
