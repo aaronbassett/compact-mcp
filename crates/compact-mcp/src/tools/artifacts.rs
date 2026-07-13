@@ -176,6 +176,13 @@ impl CompactMcp {
             Some(p) => self.workspace.resolve(p)?,
             None => scope.write_file("input.compact", &text)?,
         };
+
+        // Same compile path as `compile`, so the same import-traversal gate
+        // applies: reject any `import`/`include` target that escapes the root
+        // before the (--skip-zk) build runs, or the compiler would leak out-of-root
+        // `.compact` content into the scaffold's diagnostics.
+        compact_mcp_core::assert_imports_contained(&self.workspace, &source, &text)?;
+
         let target = scope.path().join("out");
 
         let req = CompileRequest {

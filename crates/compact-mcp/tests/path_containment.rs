@@ -316,3 +316,204 @@ async fn witness_scaffold_rejects_escaping_paths() {
 
     client.cancel().await.unwrap();
 }
+
+// ===========================================================================
+// Import/include traversal (finding H1)
+//
+// The tests above cover the ENTRY path/target_dir the client names. These cover
+// the SECOND, distinct vector: the `import "…"` / `include "…"` paths INSIDE the
+// source, which the compiler dereferences relative to the including file —
+// following `../` and absolute targets OUT of the root. The gate
+// (`assert_imports_contained`) runs in `compile_impl` / `witness_scaffold_impl`
+// BEFORE the build gate and any `compact` subprocess, so these are hermetic: a
+// rejection here proves the escape is refused before the compiler could read (and
+// leak) the out-of-root file.
+//
+// Resolution note: a `path`-based contract lives directly in the root, so a
+// single `../` escapes. Inline `source` is written to a temp scope a couple of
+// levels UNDER the root, so a lone `../` stays in-root — the inline vectors use
+// absolute targets (which escape from anywhere), matching the acceptance
+// criterion's `import "…/etc/hostname"` shape.
+// ===========================================================================
+
+/// The absolute path of the planted secret WITHOUT the `.compact` extension: the
+/// compiler appends `.compact` to every import target, so importing this hits the
+/// real out-of-root `secret.compact` (containing MARKER).
+fn secret_import_target(f: &Escape) -> String {
+    f.secret_file_abs
+        .strip_suffix(".compact")
+        .expect("secret file ends in .compact")
+        .to_string()
+}
+
+/// A `path`-based contract whose `include "../secret"` reaches the out-of-root
+/// secret file. Rejected before the compiler runs; MARKER must not leak.
+#[tokio::test]
+async fn compile_rejects_dotdot_import_via_path() {
+    let f = Escape::new();
+    std::fs::write(
+        f.root.join("main.compact"),
+        "pragma language_version >= 0.23;\ninclude \"../secret\";\n",
+    )
+    .unwrap();
+    let client = client_for(&f.root).await;
+
+    let res = client
+        .call_tool(call(
+            "compile",
+            serde_json::json!({ "path": "main.compact" }),
+        ))
+        .await;
+    assert_rejected("compile (dotdot include)", "path", MARKER, res);
+
+    client.cancel().await.unwrap();
+}
+
+/// Inline `source` importing an ABSOLUTE out-of-root path — the acceptance
+/// criterion vector. Both an absolute path to the planted secret and a bare
+/// system-file oracle (`/etc/hostname`) must be refused pre-compile.
+#[tokio::test]
+async fn compile_rejects_absolute_import_in_inline_source() {
+    let f = Escape::new();
+    let client = client_for(&f.root).await;
+
+    let vectors = [
+        ("planted secret", secret_import_target(&f)),
+        ("system file oracle", "/etc/hostname".to_string()),
+    ];
+    for (label, target) in vectors {
+        for directive in ["import", "include"] {
+            let source = format!("pragma language_version >= 0.23;\n{directive} \"{target}\";\n");
+            let res = client
+                .call_tool(call("compile", serde_json::json!({ "source": source })))
+                .await;
+            assert_rejected(&format!("compile ({directive})"), label, MARKER, res);
+        }
+    }
+
+    client.cancel().await.unwrap();
+}
+
+/// A TRANSITIVE escape: the named in-root entry includes an in-root helper that
+/// itself escapes. The recursion in the gate must catch the escape one hop away.
+#[tokio::test]
+async fn compile_rejects_transitive_import_traversal() {
+    let f = Escape::new();
+    std::fs::write(
+        f.root.join("helper.compact"),
+        "pragma language_version >= 0.23;\ninclude \"../secret\";\n",
+    )
+    .unwrap();
+    std::fs::write(
+        f.root.join("main.compact"),
+        "pragma language_version >= 0.23;\ninclude \"helper\";\n",
+    )
+    .unwrap();
+    let client = client_for(&f.root).await;
+
+    let res = client
+        .call_tool(call(
+            "compile",
+            serde_json::json!({ "path": "main.compact" }),
+        ))
+        .await;
+    assert_rejected("compile (transitive)", "path", MARKER, res);
+
+    client.cancel().await.unwrap();
+}
+
+/// `witness_scaffold` shares the compile path, so the same gate applies.
+#[tokio::test]
+async fn witness_scaffold_rejects_import_traversal() {
+    let f = Escape::new();
+    std::fs::write(
+        f.root.join("main.compact"),
+        "pragma language_version >= 0.23;\ninclude \"../secret\";\n",
+    )
+    .unwrap();
+    let client = client_for(&f.root).await;
+
+    let res = client
+        .call_tool(call(
+            "witness_scaffold",
+            serde_json::json!({ "path": "main.compact" }),
+        ))
+        .await;
+    assert_rejected("witness_scaffold (import)", "path", MARKER, res);
+
+    client.cancel().await.unwrap();
+}
+
+/// Defense-in-depth (#7): the cosmetic `source_root` (compactc's `--sourceRoot`)
+/// is now routed through `Workspace::resolve` like `target_dir`, so an escaping
+/// value is refused before the build. Valid inline source keeps this hermetic.
+#[tokio::test]
+async fn compile_rejects_escaping_source_root() {
+    let f = Escape::new();
+    let client = client_for(&f.root).await;
+
+    for (label, dir) in f.dir_vectors() {
+        let res = client
+            .call_tool(call(
+                "compile",
+                serde_json::json!({ "source": VALID_SOURCE, "source_root": dir }),
+            ))
+            .await;
+        // `source_root` reads nothing, so nothing can leak; the assertion is that
+        // the escape is cited and the call is refused, not served.
+        assert_rejected("compile (source_root)", label, MARKER, res);
+    }
+
+    client.cancel().await.unwrap();
+}
+
+/// End-to-end with the REAL compiler present: a malicious `include "../leak"`
+/// must NOT surface the out-of-root file's contents. Without the gate, the
+/// compiler reads `../leak.compact` and echoes its unbindable token in a
+/// diagnostic (empirically reproduced); with the gate the call is refused before
+/// the compiler runs. This is the guard against a future reorder that would move
+/// the scan AFTER the build — the hermetic tests above cannot catch that because
+/// they run with no compiler installed.
+#[tokio::test]
+#[cfg_attr(not(feature = "toolchain-tests"), ignore)]
+async fn real_compiler_does_not_leak_out_of_root_include() {
+    const LEAK_TOKEN: &str = "OUT_OF_ROOT_LEAK_TOKEN_c4d5e6";
+
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    // An out-of-root file whose lone bare token forces the compiler to emit a
+    // diagnostic that echoes it — the exact content-leak shape from the report.
+    std::fs::write(base.path().join("leak.compact"), format!("{LEAK_TOKEN}\n")).unwrap();
+    std::fs::write(
+        root.join("main.compact"),
+        "pragma language_version >= 0.23;\ninclude \"../leak\";\n",
+    )
+    .unwrap();
+
+    let client = client_for(&root).await;
+    let res = client
+        .call_tool(call(
+            "compile",
+            serde_json::json!({ "path": "main.compact" }),
+        ))
+        .await
+        .expect("compile call itself must not error at the protocol level");
+
+    let text = format!("{:?}", res.content);
+    assert!(
+        !text.contains(LEAK_TOKEN),
+        "out-of-root include content leaked through the compiler: {text}"
+    );
+    assert_eq!(
+        res.is_error,
+        Some(true),
+        "a traversing include must be refused, not compiled: {text}"
+    );
+    assert!(
+        text.contains("escapes workspace root"),
+        "refusal must cite import containment: {text}"
+    );
+
+    client.cancel().await.unwrap();
+}

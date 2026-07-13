@@ -130,16 +130,36 @@ impl CompactMcp {
             }
         };
 
+        // The workspace gate above validates only the ENTRY path. The compiler
+        // then dereferences `import`/`include` targets inside the source itself,
+        // following `../` and absolute paths out of the root (a content leak of
+        // out-of-root `.compact` files via diagnostics). Close that in-process
+        // BEFORE spawning the compiler: reject any directive target — in this
+        // source or any in-root file it transitively includes — that escapes the
+        // root. Runs before the build gate, so it needs no toolchain.
+        compact_mcp_core::assert_imports_contained(&self.workspace, &source, &text)?;
+
         let target_dir = self
             .workspace
             .resolve(args.target_dir.as_deref().unwrap_or("build"))?;
+
+        // `--sourceRoot` is a cosmetic source-map field, not an import search
+        // root (verified against the compiler), so it is not itself a traversal
+        // vector — but route it through the workspace like `target_dir` anyway, so
+        // no client-supplied path reaches the compiler un-contained (#7).
+        let source_root = args
+            .source_root
+            .as_deref()
+            .map(|r| self.workspace.resolve(r))
+            .transpose()?
+            .map(|p| p.to_string_lossy().into_owned());
 
         let req = CompileRequest {
             source,
             target_dir: target_dir.clone(),
             skip_zk: args.skip_zk,
             no_communications_commitment: args.no_communications_commitment,
-            source_root: args.source_root.clone(),
+            source_root,
         };
 
         // Serialize builds through the gate; a full queue is a CoreError the
