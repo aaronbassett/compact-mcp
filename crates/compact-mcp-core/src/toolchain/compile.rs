@@ -62,6 +62,27 @@ impl Toolchain {
         trailing.push(&tgt);
         let argv = self.compile_argv(&trailing);
 
+        // TOCTOU re-check (issue #9). `req.target_dir` was vetted by
+        // `Workspace::resolve` when the request was built, but `compactc` does
+        // not open it until we spawn below — up to `timeout` later. Re-assert, as
+        // late as we can before the spawn, that no symlink has been swapped into
+        // `target_dir` that would redirect the compiler's writes outside the
+        // root. `compile` holds no `Workspace`, only the resolved path, so the
+        // root-free `assert_no_symlink_swap` is used: it rejects a symlink
+        // planted as any component of the resolved path — the two mechanisms the
+        // review proved (a not-yet-existing `target_dir` planted as a symlink,
+        // and an in-root path swapped for a symlink).
+        //
+        // Residuals (defense-in-depth): (1) `compactc` creates `target_dir` and
+        // its files itself, so the spawn->open gap and the compiler's own writes
+        // inside `target_dir` are not under our `O_NOFOLLOW` control — this
+        // narrows the window from the whole compile timeout to that gap, it does
+        // not eliminate it; (2) without the workspace root here we cannot catch
+        // an *ancestor* dir swapped for a symlink whose out-of-root target
+        // already exists (the `fmt` write path, which holds a `Workspace`, closes
+        // that via `Workspace::revalidate_before_write`).
+        crate::workspace::assert_no_symlink_swap(&req.target_dir)?;
+
         let mut cmd = tokio::process::Command::new(self.bin());
         cmd.args(&argv)
             .stdin(Stdio::null())
@@ -248,6 +269,45 @@ mod tests {
         assert_eq!(out.diagnostics[0].source, crate::Source::Compactc);
         assert!(out.diagnostics[0].message.contains("unbound identifier"));
         assert_eq!(out.diagnostics[0].span.as_ref().unwrap().start.line, 7);
+    }
+
+    // Hermetic: short-circuits on the TOCTOU re-check BEFORE any subprocess, so
+    // it needs no `compact` binary and runs without `--features toolchain-tests`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compile_refuses_when_target_dir_is_swapped_for_a_symlink() {
+        // Simulate the window between `resolve` and the spawn: `target_dir` is
+        // vetted while `out` does not exist, then an attacker plants
+        // `out` -> <outside>/loot before the compiler would run. `compile` must
+        // refuse (PathEscape) and never spawn or write outside the root.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("c.compact"), COUNTER).unwrap();
+        let w = Workspace::new(d.path()).unwrap();
+        let source = w.resolve("c.compact").unwrap();
+        let target_dir = w.resolve("out").unwrap();
+
+        let outside = tempfile::tempdir().unwrap();
+        let loot = outside.path().join("loot");
+        std::fs::create_dir(&loot).unwrap();
+        std::os::unix::fs::symlink(&loot, d.path().join("out")).unwrap();
+
+        let req = CompileRequest {
+            source,
+            target_dir,
+            skip_zk: true,
+            no_communications_commitment: false,
+            source_root: None,
+        };
+        let tc = Toolchain::new("compact", None);
+        let err = tc
+            .compile(&req, CancellationToken::new(), Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::PathEscape(_)), "got {err:?}");
+        assert!(
+            std::fs::read_dir(&loot).unwrap().next().is_none(),
+            "compile must not write into the out-of-root symlink target"
+        );
     }
 
     #[tokio::test]
