@@ -57,6 +57,14 @@ impl CompactMcp {
 
     /// Apply the CLI config. Called from `main`.
     pub fn with_config(mut self, c: &crate::config::Config) -> Self {
+        // Rebuild the toolchain so `--compact-bin` / `--compiler-version` (and
+        // their env vars) actually take effect. Without this both flags parse and
+        // validate but are dropped on the floor: the server keeps the default
+        // `Toolchain::new("compact", None)`, always shelling out to whatever
+        // `compact` is on `$PATH`, unpinned. `compiler_version` reaches
+        // `compact compile` as the leading `+VERSION` token via
+        // `Toolchain::compile`. Regression-guarded in this module's tests. (#1)
+        self.toolchain = Toolchain::new(c.compact_bin.as_str(), c.compiler_version.clone());
         self.tasks = Arc::new(TaskStore::new(
             Duration::from_secs(c.default_task_ttl),
             Duration::from_secs(c.max_task_ttl),
@@ -334,5 +342,84 @@ mod tests {
         let (text, label) = s.read_input(&si(None, Some("ledger x: Counter;"))).unwrap();
         assert_eq!(text, "ledger x: Counter;");
         assert_eq!(label, "<inline>");
+    }
+
+    /// Regression guard for #1: `--compact-bin` / `--compiler-version` were parsed
+    /// and validated but never rebuilt into the server's `Toolchain`, so both were
+    /// silent no-ops — the server always ran whatever `compact` was on `$PATH`,
+    /// unpinned.
+    ///
+    /// This drives a real `compile` through a server built via the full
+    /// `Config::parse_from` -> `with_config` boundary and asserts on the captured
+    /// argv: the configured stub binary is the one executed (`argv[0]`), and the
+    /// `+VERSION` pin reaches `compact compile`. If the wiring is removed,
+    /// `with_config` leaves the default `Toolchain::new("compact", None)`, the stub
+    /// never runs, its argv log is never written, and this test fails.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn with_config_wires_compact_bin_and_compiler_version_into_the_compile_argv() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        use clap::Parser;
+        use compact_mcp_core::toolchain::compile::CompileRequest;
+        use tokio_util::sync::CancellationToken;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // A stub `compact` that appends its own path (`$0`) and every argument,
+        // one per line, to `<self>.argv`. Self-contained: no path is baked in, so
+        // it records exactly the binary the toolchain chose to exec.
+        let stub = dir.path().join("stub-compact");
+        {
+            let mut f = std::fs::File::create(&stub).unwrap();
+            writeln!(f, "#!/bin/sh").unwrap();
+            writeln!(f, "printf '%s\\n' \"$0\" \"$@\" >> \"$0.argv\"").unwrap();
+            writeln!(f, "exit 0").unwrap();
+        }
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.path().join("c.compact"), "ledger x: Counter;").unwrap();
+
+        let ws = compact_mcp_core::Workspace::new(dir.path()).unwrap();
+        let cfg = crate::config::Config::parse_from([
+            "compact-mcp",
+            "--compact-bin",
+            stub.to_str().unwrap(),
+            "--compiler-version",
+            "0.42.0",
+        ]);
+        let server = CompactMcp::new(ws).with_config(&cfg);
+
+        let req = CompileRequest {
+            source: dir.path().join("c.compact"),
+            target_dir: dir.path().join("out"),
+            skip_zk: true,
+            no_communications_commitment: false,
+            source_root: None,
+        };
+        server
+            .toolchain
+            .compile(&req, CancellationToken::new(), Duration::from_secs(30))
+            .await
+            .expect("stub compile should exit 0");
+
+        let argv = std::fs::read_to_string(dir.path().join("stub-compact.argv")).expect(
+            "the configured --compact-bin stub was never executed: `with_config` \
+             dropped the toolchain wiring",
+        );
+        let lines: Vec<&str> = argv.lines().collect();
+        assert_eq!(
+            lines.first().copied(),
+            stub.to_str(),
+            "argv[0] must be the configured --compact-bin, got {argv:?}",
+        );
+        assert!(
+            lines.contains(&"compile"),
+            "compile subcommand missing from argv: {argv:?}",
+        );
+        assert!(
+            lines.contains(&"+0.42.0"),
+            "--compiler-version did not reach `compact compile` as +VERSION: {argv:?}",
+        );
     }
 }
