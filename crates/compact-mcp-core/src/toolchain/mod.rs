@@ -90,11 +90,19 @@ impl Toolchain {
         // branch. Guard `pid != 0`: if a future refactor lost the pid, `killpg(0)`
         // would signal our OWN process group — see the compile path's note.
         let pid = child.id().unwrap_or(0);
+        // Reap the whole process GROUP if THIS future is dropped before any arm
+        // resolves (e.g. an HTTP client disconnects mid-run). `spawn_group`'s
+        // `kill_on_drop` reaps only the direct child, orphaning the forked worker;
+        // this guard closes that gap. Each arm below reaps explicitly
+        // (cancel/timeout) or sees the child already exit (success), so each
+        // disarms the guard to avoid a double kill.
+        let mut reaper = proc::KillGroupOnDrop::new(pid);
 
         let output = tokio::select! {
             biased;
 
             _ = ct.cancelled() => {
+                reaper.disarm();
                 if pid != 0 {
                     // `kill_group` is blocking (SIGTERM → 250ms → SIGKILL); run it
                     // off the async worker and AWAIT it so the process tree is
@@ -104,12 +112,16 @@ impl Toolchain {
                 return Err(CoreError::Cancelled);
             }
             _ = tokio::time::sleep(self.timeout) => {
+                reaper.disarm();
                 if pid != 0 {
                     let _ = tokio::task::spawn_blocking(move || proc::kill_group(pid)).await;
                 }
                 return Err(CoreError::Timeout(self.timeout));
             }
-            out = child.wait_with_output() => out?,
+            out = child.wait_with_output() => {
+                reaper.disarm();
+                out?
+            }
         };
 
         Ok(Output {
