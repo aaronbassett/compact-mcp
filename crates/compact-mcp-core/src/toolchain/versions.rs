@@ -141,11 +141,74 @@ mod tests {
     #[tokio::test]
     #[cfg_attr(not(feature = "toolchain-tests"), ignore)]
     async fn compiler_version_pin_is_honoured() {
-        let tc = crate::toolchain::Toolchain::new("compact", Some("0.31.0".into()));
-        let out = tc
-            .run_compile(&["--version"], &CancellationToken::new())
+        // Derive the expected version from the compiler that is ACTUALLY
+        // installed rather than a hard-coded literal, so this can never drift
+        // when CI bumps `COMPACT_VERSION` (the mismatch that made issue #15's
+        // `toolchain` job red).
+        //
+        // What this proves: a pin that RESOLVES reports the pinned version
+        // back. We pin to the un-pinned default (guaranteed installed) and
+        // confirm the pinned `+VERSION` invocation reports that same version.
+        // What this does NOT prove on its own: that the `+VERSION` token
+        // actually reached `compact compile`. A dropped token would fall back
+        // to that same default and still match here. The companion test
+        // `a_bogus_compiler_pin_is_rejected_not_silently_defaulted` closes that
+        // gap by pinning to a version that is NOT installed.
+        let ct = CancellationToken::new();
+
+        // `compact compile --version` with no pin: the default/current
+        // compiler, guaranteed to be the one installed by `compact update`.
+        let default_version = crate::toolchain::Toolchain::new("compact", None)
+            .run_compile(&["--version"], &ct)
             .await
-            .unwrap();
-        assert_eq!(out.stdout.trim(), "0.31.0");
+            .unwrap()
+            .stdout
+            .trim()
+            .to_string();
+        assert!(
+            semver::Version::parse(&default_version).is_ok(),
+            "un-pinned `compact compile --version` did not report a semver: {default_version:?}"
+        );
+
+        // Pin explicitly to that version and confirm the resolved pin reports
+        // it back exactly.
+        let pinned = crate::toolchain::Toolchain::new("compact", Some(default_version.clone()));
+        let out = pinned.run_compile(&["--version"], &ct).await.unwrap();
+        assert_eq!(
+            out.stdout.trim(),
+            default_version,
+            "pinned `compact compile +{default_version} --version` did not honour the pin"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(feature = "toolchain-tests"), ignore)]
+    async fn a_bogus_compiler_pin_is_rejected_not_silently_defaulted() {
+        // Independently prove the `+VERSION` token actually reaches `compact
+        // compile`. Pin to a version that is deliberately NOT installed: the
+        // invocation must be REJECTED (non-zero exit, no version on stdout),
+        // never silently satisfied by the default compiler.
+        //
+        // This is the assertion the positive test above cannot make: if
+        // `compile_argv` dropped the token, this bogus pin would fall back to
+        // the installed default and wrongly succeed with a valid version and a
+        // zero exit — which this test would catch. It reintroduces no drift
+        // because it asserts a *rejection*, not any specific version. The
+        // literal `0.0.0-not-installed` is a valid semver (so it passes the
+        // argv builder's shape) that no real release will ever occupy.
+        let ct = CancellationToken::new();
+        let bogus = crate::toolchain::Toolchain::new("compact", Some("0.0.0-not-installed".into()));
+        let out = bogus.run_compile(&["--version"], &ct).await.unwrap();
+
+        assert!(
+            out.status != 0,
+            "a bogus `+VERSION` pin must exit non-zero, not fall back to the default compiler; \
+             got {out:?}"
+        );
+        assert!(
+            semver::Version::parse(out.stdout.trim()).is_err(),
+            "a bogus `+VERSION` pin must not report a valid version on stdout; got {:?}",
+            out.stdout
+        );
     }
 }
