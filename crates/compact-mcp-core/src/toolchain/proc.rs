@@ -138,21 +138,47 @@ mod tests {
 
         assert!(is_alive(grandchild_pid), "grandchild should be running");
 
+        // TIMING is the load-bearing assertion. `kill_group` must reap the whole
+        // group promptly: SIGTERM lands on the grandchild `sleep` at once, with a
+        // SIGKILL backstop 250ms later. A NEUTERED (no-op) `kill_group` signals
+        // nothing, so the grandchild survives until its own `sleep 5` drains ~5s
+        // later. We therefore bound the wait FAR below that natural expiry: a
+        // grandchild still alive at the deadline proves the group was never killed.
+        //
+        // Ordering is what makes this non-vacuous. The prior version did
+        // `child.wait().await` FIRST — but a neutered `kill_group` leaves the `sh`
+        // wrapper `wait`ing on its backgrounded `sleep 5`, so `child.wait()` itself
+        // blocks the full ~5s; by the time it returned the grandchild had died
+        // naturally, so `is_alive` read false and a no-op reap still PASSED (just
+        // slower). Here we start the clock, kill, then poll the grandchild directly
+        // and never `wait()` before the deadline.
+        //
+        // Poll (don't single-sleep): after SIGKILL the grandchild is briefly a
+        // zombie until its subreaper (launchd/init) reaps it, and `is_alive` reads
+        // true for a zombie; a healthy reap clears in well under the deadline.
+        const REAP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+        let start = std::time::Instant::now();
         kill_group(child_pid);
-        let _ = child.wait().await;
 
-        // Poll instead of a single fixed sleep: after SIGKILL the grandchild becomes
-        // a zombie until its subreaper (launchd/init) reaps it, and `is_alive` reads
-        // true for a zombie. Poll up to ~2s so a loaded CI box can't flake, while a
-        // genuine orphan (still sleeping) keeps failing the assertion.
         let mut reaped = false;
-        for _ in 0..40 {
+        while start.elapsed() < REAP_DEADLINE {
             if !is_alive(grandchild_pid) {
                 reaped = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        assert!(reaped, "grandchild was orphaned — process group not killed");
+        assert!(
+            reaped,
+            "grandchild still alive after {:?} (deadline {REAP_DEADLINE:?}; natural \
+             `sleep 5` expiry ~5s) — kill_group did not reap the process group",
+            start.elapsed(),
+        );
+
+        // Reap the `sh` wrapper so it doesn't linger as a zombie. In the healthy
+        // path the group is already dead, so this returns at once; on the failure
+        // path we've already panicked above (kill_on_drop then cleans up the direct
+        // child).
+        let _ = child.wait().await;
     }
 }
