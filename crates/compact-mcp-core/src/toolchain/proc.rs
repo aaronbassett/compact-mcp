@@ -96,7 +96,11 @@ impl Drop for KillGroupOnDrop {
         // a runtime, fall back to a synchronous reap so the group is never leaked.
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                handle.spawn_blocking(move || kill_group(pid));
+                // Fire-and-forget: `Drop` has nothing to await the handle with, so
+                // drop the `JoinHandle` explicitly to detach the reaping task.
+                // (`let _ =` would trip clippy's `let_underscore_future`, since a
+                // `JoinHandle` is itself a future.)
+                drop(handle.spawn_blocking(move || kill_group(pid)));
             }
             Err(_) => kill_group(pid),
         }
