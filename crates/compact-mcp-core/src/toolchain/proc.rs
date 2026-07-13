@@ -45,6 +45,68 @@ pub fn kill_group(_pid: u32) {
     tracing::warn!("process-group kill is unsupported on this platform; compactc may be orphaned");
 }
 
+/// RAII guard that reaps a spawned process GROUP if it is still armed when it is
+/// dropped. [`spawn_group`] sets `kill_on_drop`, but that reaps only the DIRECT
+/// child (the `compact` wrapper); the worker it forks (`compactc.bin` /
+/// `format-compact`) shares the group and would survive. On a plain future-drop —
+/// e.g. an HTTP client disconnecting mid-build, the scenario `Toolchain::run` and
+/// `Toolchain::compile` name in their own docs — there is no cancel or timeout arm
+/// to run [`kill_group`], so without this guard that heavyweight worker is
+/// orphaned with no reap, no timeout, and no `BuildGate` accounting.
+///
+/// The cancel/timeout arms reap explicitly (awaited, so the gate permit is held
+/// until the tree is dead) and [`disarm`](Self::disarm) this guard, so it never
+/// double-kills; it therefore fires ONLY on the drop-before-resolution path.
+pub(crate) struct KillGroupOnDrop {
+    pid: u32,
+    armed: bool,
+}
+
+impl KillGroupOnDrop {
+    /// Arm the guard for `pid`, the group leader (its pgid equals its pid — see
+    /// [`spawn_group`]). A `0` pid is inert on drop (see the `killpg(0)` note in
+    /// [`Drop`]).
+    pub(crate) fn new(pid: u32) -> Self {
+        Self { pid, armed: true }
+    }
+
+    /// Take over responsibility for reaping (or record that the child already
+    /// exited), so [`Drop`] does nothing. Every `select!` arm that resolves calls
+    /// this before returning.
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for KillGroupOnDrop {
+    fn drop(&mut self) {
+        // Reuse the same `pid != 0` self-kill guard the async arms use: `killpg`
+        // with a pgid of 0 targets the CALLER's process group — a self-inflicted
+        // kill — so a `0` pid (a lost `child.id()`) must stay inert here too.
+        if !self.armed || self.pid == 0 {
+            return;
+        }
+        let pid = self.pid;
+        // `kill_group` BLOCKS for the ~250ms SIGTERM->SIGKILL grace. We cannot
+        // `.await` in `Drop`, and running it inline would stall the Tokio worker
+        // that is dropping this future for the whole grace period. Mirror the
+        // cancel/timeout path and offload it to the blocking pool: fire-and-forget
+        // (Drop has nothing to await it with), but the entire GROUP is still reaped
+        // because the grandchild keeps the group alive until SIGKILL lands. Outside
+        // a runtime, fall back to a synchronous reap so the group is never leaked.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                // Fire-and-forget: `Drop` has nothing to await the handle with, so
+                // drop the `JoinHandle` explicitly to detach the reaping task.
+                // (`let _ =` would trip clippy's `let_underscore_future`, since a
+                // `JoinHandle` is itself a future.)
+                drop(handle.spawn_blocking(move || kill_group(pid)));
+            }
+            Err(_) => kill_group(pid),
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 pub(crate) fn is_alive(pid: u32) -> bool {
     // SAFETY: signal 0 performs error checking without sending a signal.
