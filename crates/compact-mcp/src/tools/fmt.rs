@@ -52,9 +52,10 @@ impl CompactMcp {
         // it as a successful call with `isError: true`, matching the toolchain
         // tools. `McpError` stays reserved for bad request shapes (the XOR check
         // above).
+        let ct = self.current_cancel_token();
         match self
             .toolchain
-            .format(&self.workspace, input, args.write)
+            .format(&self.workspace, input, args.write, &ct)
             .await
         {
             Ok(out) => {
@@ -80,9 +81,10 @@ impl CompactMcp {
         &self,
         Parameters(args): Parameters<FixupArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let ct = self.current_cancel_token();
         match self
             .toolchain
-            .fixup(&self.workspace, &args.path, args.write)
+            .fixup(&self.workspace, &args.path, args.write, &ct)
             .await
         {
             Ok(out) => {

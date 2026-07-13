@@ -1,4 +1,5 @@
 use serde::Serialize;
+use tokio_util::sync::CancellationToken;
 
 use super::Toolchain;
 use crate::CoreError;
@@ -70,12 +71,12 @@ pub fn skew_for(language: &str) -> Skew {
 }
 
 impl Toolchain {
-    pub async fn versions(&self) -> Result<Versions, CoreError> {
-        let compact_cli = self.line(&["--version"], false).await?;
-        let compiler = self.line(&["--version"], true).await?;
-        let language = self.line(&["--language-version"], true).await?;
-        let ledger = self.line(&["--ledger-version"], true).await?;
-        let runtime = self.line(&["--runtime-version"], true).await?;
+    pub async fn versions(&self, ct: &CancellationToken) -> Result<Versions, CoreError> {
+        let compact_cli = self.line(&["--version"], false, ct).await?;
+        let compiler = self.line(&["--version"], true, ct).await?;
+        let language = self.line(&["--language-version"], true, ct).await?;
+        let ledger = self.line(&["--ledger-version"], true, ct).await?;
+        let runtime = self.line(&["--runtime-version"], true, ct).await?;
 
         Ok(Versions {
             skew: skew_for(&language),
@@ -126,7 +127,7 @@ mod tests {
     #[cfg_attr(not(feature = "toolchain-tests"), ignore)]
     async fn versions_reads_the_real_toolchain() {
         let tc = crate::toolchain::Toolchain::new("compact", None);
-        let v = tc.versions().await.unwrap();
+        let v = tc.versions(&CancellationToken::new()).await.unwrap();
         assert!(
             v.compact_cli.starts_with("compact "),
             "got {:?}",
@@ -141,7 +142,10 @@ mod tests {
     #[cfg_attr(not(feature = "toolchain-tests"), ignore)]
     async fn compiler_version_pin_is_honoured() {
         let tc = crate::toolchain::Toolchain::new("compact", Some("0.31.0".into()));
-        let out = tc.run_compile(&["--version"]).await.unwrap();
+        let out = tc
+            .run_compile(&["--version"], &CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(out.stdout.trim(), "0.31.0");
     }
 }

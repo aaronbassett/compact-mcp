@@ -5,10 +5,21 @@ pub mod proc;
 pub mod versions;
 
 use std::process::Stdio;
+use std::time::Duration;
 
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 use crate::CoreError;
+
+/// Default wall-clock bound for a single non-compile `compact` subprocess
+/// (`list`/`check`/`update`/`clean`/`format`/`fixup`/version probes). Sized so a
+/// typical `update` download clears it while a hung process still can't pin a
+/// worker indefinitely. A genuinely slow download on a throttled link can trip
+/// it and be killed mid-install; that is an operator-gated tool, so the bound
+/// trades a rare interrupted install for a guaranteed ceiling. Override with
+/// [`Toolchain::with_timeout`].
+const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
 pub struct Output {
@@ -23,6 +34,7 @@ pub struct Output {
 pub struct Toolchain {
     bin: String,
     compiler_version: Option<String>,
+    timeout: Duration,
 }
 
 impl Toolchain {
@@ -30,28 +42,80 @@ impl Toolchain {
         Self {
             bin: bin.into(),
             compiler_version,
+            timeout: DEFAULT_RUN_TIMEOUT,
         }
+    }
+
+    /// Override the per-invocation subprocess timeout (default
+    /// [`DEFAULT_RUN_TIMEOUT`]). Applies to every non-compile `compact` call;
+    /// the heavy `compile` path takes its own timeout per request.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     pub(crate) fn bin(&self) -> &str {
         &self.bin
     }
 
-    pub(crate) async fn run(&self, args: &[&str]) -> Result<Output, CoreError> {
-        let out = Command::new(&self.bin)
-            .args(args)
+    /// Run `compact <args>` as its own process group, bounded by `self.timeout`
+    /// and `ct`. Mirrors [`Toolchain::compile`]'s reaping: on timeout or
+    /// cancellation the whole process tree (`compact` execs `compactc.bin`; some
+    /// subcommands fork a downloader) is SIGTERM→SIGKILLed off the async worker,
+    /// and `kill_on_drop` reaps the direct child if this future is simply dropped
+    /// (e.g. an HTTP client disconnects). Without this a hung subprocess would be
+    /// awaited forever and orphaned tools would outlive the request.
+    pub(crate) async fn run(
+        &self,
+        args: &[&str],
+        ct: &CancellationToken,
+    ) -> Result<Output, CoreError> {
+        if ct.is_cancelled() {
+            return Err(CoreError::Cancelled);
+        }
+
+        let mut cmd = Command::new(&self.bin);
+        cmd.args(args)
             .stdin(Stdio::null())
-            .output()
-            .await
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => CoreError::ToolchainNotFound,
-                _ => CoreError::Io(e),
-            })?;
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let child = proc::spawn_group(&mut cmd).map_err(|e| match e {
+            CoreError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+                CoreError::ToolchainNotFound
+            }
+            other => other,
+        })?;
+        // Captured before `select!` moves `child` into the `wait_with_output`
+        // branch. Guard `pid != 0`: if a future refactor lost the pid, `killpg(0)`
+        // would signal our OWN process group — see the compile path's note.
+        let pid = child.id().unwrap_or(0);
+
+        let output = tokio::select! {
+            biased;
+
+            _ = ct.cancelled() => {
+                if pid != 0 {
+                    // `kill_group` is blocking (SIGTERM → 250ms → SIGKILL); run it
+                    // off the async worker and AWAIT it so the process tree is
+                    // fully reaped before we return — same discipline as `compile`.
+                    let _ = tokio::task::spawn_blocking(move || proc::kill_group(pid)).await;
+                }
+                return Err(CoreError::Cancelled);
+            }
+            _ = tokio::time::sleep(self.timeout) => {
+                if pid != 0 {
+                    let _ = tokio::task::spawn_blocking(move || proc::kill_group(pid)).await;
+                }
+                return Err(CoreError::Timeout(self.timeout));
+            }
+            out = child.wait_with_output() => out?,
+        };
 
         Ok(Output {
-            status: out.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            status: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
     }
 
@@ -67,18 +131,27 @@ impl Toolchain {
     }
 
     /// `compact compile [+VERSION] <args...>`. The `+VERSION` pin MUST come first.
-    pub(crate) async fn run_compile(&self, args: &[&str]) -> Result<Output, CoreError> {
+    pub(crate) async fn run_compile(
+        &self,
+        args: &[&str],
+        ct: &CancellationToken,
+    ) -> Result<Output, CoreError> {
         let full = self.compile_argv(args);
         let refs: Vec<&str> = full.iter().map(String::as_str).collect();
-        self.run(&refs).await
+        self.run(&refs, ct).await
     }
 
     /// One line of stdout, trimmed. Fails loudly on a non-zero exit.
-    pub(crate) async fn line(&self, args: &[&str], compile: bool) -> Result<String, CoreError> {
+    pub(crate) async fn line(
+        &self,
+        args: &[&str],
+        compile: bool,
+        ct: &CancellationToken,
+    ) -> Result<String, CoreError> {
         let out = if compile {
-            self.run_compile(args).await?
+            self.run_compile(args, ct).await?
         } else {
-            self.run(args).await?
+            self.run(args, ct).await?
         };
         if out.status != 0 {
             let argv = if compile {
@@ -102,8 +175,12 @@ impl Toolchain {
     /// `run` alone never inspects `status`, so without this a failed `list`/
     /// `check` would return `Ok` carrying error text and the caller would
     /// misreport it as an empty list / not-up-to-date.
-    async fn run_checked(&self, args: &[&str]) -> Result<Output, CoreError> {
-        let out = self.run(args).await?;
+    async fn run_checked(
+        &self,
+        args: &[&str],
+        ct: &CancellationToken,
+    ) -> Result<Output, CoreError> {
+        let out = self.run(args, ct).await?;
         if out.status != 0 {
             return Err(CoreError::ToolchainFailed {
                 cmd: format!("{} {}", self.bin, args.join(" ")),
@@ -114,17 +191,21 @@ impl Toolchain {
         Ok(out)
     }
 
-    pub async fn list(&self) -> Result<String, CoreError> {
-        Ok(self.run_checked(&["list"]).await?.stdout)
+    pub async fn list(&self, ct: &CancellationToken) -> Result<String, CoreError> {
+        Ok(self.run_checked(&["list"], ct).await?.stdout)
     }
 
-    pub async fn check(&self) -> Result<String, CoreError> {
-        let out = self.run_checked(&["check"]).await?;
+    pub async fn check(&self, ct: &CancellationToken) -> Result<String, CoreError> {
+        let out = self.run_checked(&["check"], ct).await?;
         Ok(joined_output(&out))
     }
 
     /// Downloads and installs a compiler. Network + filesystem side effects.
-    pub async fn update(&self, version: Option<&str>) -> Result<String, CoreError> {
+    pub async fn update(
+        &self,
+        version: Option<&str>,
+        ct: &CancellationToken,
+    ) -> Result<String, CoreError> {
         // A version is passed straight to `compact` as an argv token. Reject a
         // non-version value (e.g. a flag like `--foo`) before it can steer the
         // subprocess — defense in depth even though the tool is operator-gated.
@@ -135,15 +216,15 @@ impl Toolchain {
             })?;
         }
         let out = match version {
-            Some(v) => self.run_checked(&["update", v]).await?,
-            None => self.run_checked(&["update"]).await?,
+            Some(v) => self.run_checked(&["update", v], ct).await?,
+            None => self.run_checked(&["update"], ct).await?,
         };
         Ok(joined_output(&out))
     }
 
     /// Removes every installed compiler version. Destructive.
-    pub async fn clean(&self) -> Result<String, CoreError> {
-        let out = self.run_checked(&["clean"]).await?;
+    pub async fn clean(&self, ct: &CancellationToken) -> Result<String, CoreError> {
+        let out = self.run_checked(&["clean"], ct).await?;
         Ok(joined_output(&out))
     }
 }
@@ -160,7 +241,77 @@ fn joined_output(out: &Output) -> String {
 
 #[cfg(test)]
 mod tests {
+    // `Duration` and `CancellationToken` come in via the parent's imports.
     use super::*;
+
+    #[tokio::test]
+    async fn run_times_out_instead_of_hanging() {
+        // A subprocess that would run for 30s must be bounded by the toolchain
+        // timeout and reaped — never awaited to completion. Hermetic: uses
+        // `sleep`, so it needs no `compact` binary.
+        let tc = Toolchain::new("sleep", None).with_timeout(Duration::from_millis(200));
+        let start = std::time::Instant::now();
+        let err = tc
+            .run(&["30"], &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Timeout(_)), "got {err:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "run() blocked past the timeout instead of killing the child"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_cancels_a_running_child() {
+        // Cancellation that arrives WHILE the child is running (the `select!`
+        // cancel arm, not the pre-spawn guard) must abort it promptly.
+        let tc = Toolchain::new("sleep", None).with_timeout(Duration::from_secs(30));
+        let ct = CancellationToken::new();
+        let ct_child = ct.clone();
+        let handle = tokio::spawn(async move { tc.run(&["30"], &ct_child).await });
+        // Give the child time to spawn, then cancel.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let start = std::time::Instant::now();
+        ct.cancel();
+        let err = handle.await.unwrap().unwrap_err();
+        assert!(matches!(err, CoreError::Cancelled), "got {err:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "run() did not react to cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_returns_output_for_a_fast_command() {
+        // Happy path unchanged: a quick command's stdout is captured verbatim.
+        let tc = Toolchain::new("echo", None).with_timeout(Duration::from_secs(5));
+        let out = tc.run(&["hello"], &CancellationToken::new()).await.unwrap();
+        assert_eq!(out.status, 0);
+        assert_eq!(out.stdout.trim(), "hello");
+    }
+
+    #[tokio::test]
+    async fn run_returns_cancelled_for_a_pre_cancelled_token() {
+        // The pre-spawn guard short-circuits before any subprocess is spawned.
+        let tc = Toolchain::new("sleep", None);
+        let ct = CancellationToken::new();
+        ct.cancel();
+        let err = tc.run(&["30"], &ct).await.unwrap_err();
+        assert!(matches!(err, CoreError::Cancelled), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn run_maps_a_missing_binary_to_toolchain_not_found() {
+        // A spawn `NotFound` must surface as `ToolchainNotFound`, not a raw `Io`,
+        // so callers report "compact is not installed" rather than a generic error.
+        let tc = Toolchain::new("compact-does-not-exist-xyz", None);
+        let err = tc
+            .run(&["list"], &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::ToolchainNotFound), "got {err:?}");
+    }
 
     #[test]
     fn compile_argv_places_the_pin_first_and_is_the_error_source_of_truth() {

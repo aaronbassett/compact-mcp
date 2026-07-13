@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use serde::Serialize;
+use tokio_util::sync::CancellationToken;
 
 use super::{Output, Toolchain};
 use crate::{CoreError, Diagnostic, Workspace, analyze};
@@ -38,8 +39,9 @@ impl Toolchain {
         ws: &Workspace,
         input: FmtInput,
         write: bool,
+        ct: &CancellationToken,
     ) -> Result<FormatOutcome, CoreError> {
-        self.rewrite(ws, input, write, "format").await
+        self.rewrite(ws, input, write, "format", ct).await
     }
 
     pub async fn fixup(
@@ -47,8 +49,9 @@ impl Toolchain {
         ws: &Workspace,
         path: &str,
         write: bool,
+        ct: &CancellationToken,
     ) -> Result<FormatOutcome, CoreError> {
-        self.rewrite(ws, FmtInput::Path(path.to_string()), write, "fixup")
+        self.rewrite(ws, FmtInput::Path(path.to_string()), write, "fixup", ct)
             .await
     }
 
@@ -60,6 +63,7 @@ impl Toolchain {
         input: FmtInput,
         write: bool,
         subcommand: &str,
+        ct: &CancellationToken,
     ) -> Result<FormatOutcome, CoreError> {
         // Precondition, enforced BEFORE the parse gate: `write: true` can only
         // rewrite a file on disk, never inline source. Hoisted so the same invalid
@@ -117,7 +121,9 @@ impl Toolchain {
                     "`write: true` requires `path`, not `source`".into(),
                 ));
             };
-            let out = self.run(&[subcommand, &target.to_string_lossy()]).await?;
+            let out = self
+                .run(&[subcommand, &target.to_string_lossy()], ct)
+                .await?;
             if out.status != 0 {
                 return Err(self.toolchain_failed(subcommand, &target, out));
             }
@@ -133,7 +139,7 @@ impl Toolchain {
         // Non-destructive: format a copy inside the workspace.
         let scope = ws.temp_scope(subcommand)?;
         let copy = scope.write_file("input.compact", &before)?;
-        let out = self.run(&[subcommand, &copy.to_string_lossy()]).await?;
+        let out = self.run(&[subcommand, &copy.to_string_lossy()], ct).await?;
         if out.status != 0 {
             return Err(self.toolchain_failed(subcommand, &copy, out));
         }
@@ -169,6 +175,11 @@ mod tests {
     use super::*;
     use crate::Workspace;
 
+    /// A never-cancelled token: the format tests exercise output, not cancellation.
+    fn ct() -> CancellationToken {
+        CancellationToken::new()
+    }
+
     const MESSY: &str = "pragma language_version >= 0.23;\nimport CompactStandardLibrary;\nexport ledger    a:Counter;\n";
     const BROKEN: &str = "export circuit oops(): [] { let x = }";
 
@@ -184,7 +195,7 @@ mod tests {
         let (_d, w) = ws();
         let tc = Toolchain::new("compact", None);
         let out = tc
-            .format(&w, FmtInput::Source(MESSY.into()), false)
+            .format(&w, FmtInput::Source(MESSY.into()), false, &ct())
             .await
             .unwrap();
         assert!(out.ok);
@@ -202,11 +213,11 @@ mod tests {
         let (_d, w) = ws();
         let tc = Toolchain::new("compact", None);
         let once = tc
-            .format(&w, FmtInput::Source(MESSY.into()), false)
+            .format(&w, FmtInput::Source(MESSY.into()), false, &ct())
             .await
             .unwrap();
         let twice = tc
-            .format(&w, FmtInput::Source(once.formatted.unwrap()), false)
+            .format(&w, FmtInput::Source(once.formatted.unwrap()), false, &ct())
             .await
             .unwrap();
         assert!(twice.ok);
@@ -220,7 +231,7 @@ mod tests {
         let (_d, w) = ws();
         let tc = Toolchain::new("compact", None);
         let out = tc
-            .format(&w, FmtInput::Source(BROKEN.into()), false)
+            .format(&w, FmtInput::Source(BROKEN.into()), false, &ct())
             .await
             .unwrap();
         assert!(!out.ok);
@@ -241,7 +252,7 @@ mod tests {
         std::fs::write(d.path().join("m.compact"), MESSY).unwrap();
         let tc = Toolchain::new("compact", None);
         let out = tc
-            .format(&w, FmtInput::Path("m.compact".into()), true)
+            .format(&w, FmtInput::Path("m.compact".into()), true, &ct())
             .await
             .unwrap();
         assert!(out.ok && out.changed);
@@ -261,7 +272,7 @@ mod tests {
         let clean = "pragma language_version >= 0.23;\n\nimport CompactStandardLibrary;\n\nexport ledger a: Counter;\n";
         std::fs::write(d.path().join("clean.compact"), clean).unwrap();
         let tc = Toolchain::new("compact", None);
-        let out = tc.fixup(&w, "clean.compact", false).await.unwrap();
+        let out = tc.fixup(&w, "clean.compact", false, &ct()).await.unwrap();
         assert!(out.ok);
         assert!(
             !out.changed,
@@ -285,7 +296,7 @@ mod tests {
         let tc = Toolchain::new("compact", None);
         let huge = "x".repeat(crate::MAX_SOURCE_BYTES + 1);
         let err = tc
-            .format(&w, FmtInput::Source(huge), false)
+            .format(&w, FmtInput::Source(huge), false, &ct())
             .await
             .unwrap_err();
         assert!(matches!(err, CoreError::InvalidArgs(_)), "got {err:?}");
@@ -299,7 +310,7 @@ mod tests {
         let (_d, w) = ws();
         let tc = Toolchain::new("compact", None);
         let err = tc
-            .format(&w, FmtInput::Source(BROKEN.into()), true)
+            .format(&w, FmtInput::Source(BROKEN.into()), true, &ct())
             .await
             .unwrap_err();
         assert!(matches!(err, CoreError::InvalidArgs(_)), "got {err:?}");

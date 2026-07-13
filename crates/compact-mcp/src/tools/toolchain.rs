@@ -58,7 +58,8 @@ impl CompactMcp {
         // opaquely — the caller would see "internal error", never our message —
         // so we surface it as a successful call with `isError: true`, matching
         // the analysis tools. `McpError` stays reserved for bad request shapes.
-        match self.toolchain.versions().await {
+        let ct = self.current_cancel_token();
+        match self.toolchain.versions(&ct).await {
             Ok(v) => Ok(Self::json_result(serde_json::to_value(v).unwrap(), false)),
             Err(e) => Ok(Self::json_result(json!({ "error": e.to_string() }), true)),
         }
@@ -66,7 +67,8 @@ impl CompactMcp {
 
     #[tool(description = "List Compact compiler versions available to the toolchain.")]
     async fn toolchain_list(&self) -> Result<CallToolResult, McpError> {
-        match self.toolchain.list().await {
+        let ct = self.current_cancel_token();
+        match self.toolchain.list(&ct).await {
             Ok(out) => Ok(Self::json_result(
                 json!({ "versions": parse_list(&out), "raw": out }),
                 false,
@@ -79,7 +81,8 @@ impl CompactMcp {
         description = "Check whether a newer Compact compiler is available. Performs network I/O."
     )]
     async fn toolchain_check(&self) -> Result<CallToolResult, McpError> {
-        match self.toolchain.check().await {
+        let ct = self.current_cancel_token();
+        match self.toolchain.check(&ct).await {
             Ok(out) => Ok(Self::json_result(
                 json!({ "up_to_date": out.contains("Up to date"), "raw": out }),
                 false,
@@ -100,7 +103,8 @@ impl CompactMcp {
         &self,
         Parameters(args): Parameters<UpdateArgs>,
     ) -> Result<CallToolResult, McpError> {
-        match self.toolchain.update(args.version.as_deref()).await {
+        let ct = self.current_cancel_token();
+        match self.toolchain.update(args.version.as_deref(), &ct).await {
             Ok(raw) => Ok(Self::json_result(json!({ "raw": raw.trim() }), false)),
             Err(e) => Ok(Self::json_result(json!({ "error": e.to_string() }), true)),
         }
@@ -112,7 +116,8 @@ impl CompactMcp {
         annotations(destructive_hint = true, idempotent_hint = true)
     )]
     async fn toolchain_clean(&self) -> Result<CallToolResult, McpError> {
-        match self.toolchain.clean().await {
+        let ct = self.current_cancel_token();
+        match self.toolchain.clean(&ct).await {
             Ok(raw) => Ok(Self::json_result(json!({ "raw": raw.trim() }), false)),
             Err(e) => Ok(Self::json_result(json!({ "error": e.to_string() }), true)),
         }
