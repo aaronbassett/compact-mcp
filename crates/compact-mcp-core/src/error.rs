@@ -44,6 +44,9 @@ pub enum CoreError {
 
     #[error("malformed artifact {path}: {reason}")]
     MalformedArtifact { path: PathBuf, reason: String },
+
+    #[error("task store is full (max {0})")]
+    TaskStoreFull(usize),
 }
 
 #[cfg(test)]

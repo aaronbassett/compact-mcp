@@ -89,11 +89,12 @@ impl Toolchain {
 
             _ = ct.cancelled() => {
                 reaper.disarm();
-                // `child` is moved into the `wait_with_output` branch below when
-                // `select!` eagerly constructs all branch futures, so it cannot be
-                // referenced here. `kill_group` reaches the whole process tree via
-                // the pid captured before `select!`; when this branch wins, the
-                // still-owned (never polled) `wait_with_output` future is dropped,
+                // `child` is moved into the `wait_with_capped_output` branch below
+                // when `select!` eagerly constructs all branch futures, so it
+                // cannot be referenced here. `kill_group` reaches the whole process
+                // tree via the pid captured before `select!`; when this branch
+                // wins, the still-owned (never polled) `wait_with_capped_output`
+                // future is dropped,
                 // and `Child`'s `kill_on_drop` (set in `proc::spawn_group`) reaps
                 // the direct child through tokio's orphan queue.
                 //
@@ -127,7 +128,7 @@ impl Toolchain {
                 }
                 return Err(CoreError::Timeout(timeout));
             }
-            out = child.wait_with_output() => {
+            out = proc::wait_with_capped_output(child, self.output_limit) => {
                 reaper.disarm();
                 out?
             }
@@ -135,8 +136,10 @@ impl Toolchain {
 
         let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
         let status = output.status.code().unwrap_or(-1);
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr =
+            proc::lossy_with_marker(&output.stderr, output.stderr_truncated, self.output_limit);
+        let stdout =
+            proc::lossy_with_marker(&output.stdout, output.stdout_truncated, self.output_limit);
 
         match status {
             0 => Ok(CompileOutcome {

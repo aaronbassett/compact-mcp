@@ -1,4 +1,94 @@
+use tokio::io::AsyncReadExt;
+
 use crate::CoreError;
+
+/// A finished subprocess's exit status plus its size-capped stdout/stderr.
+/// `*_truncated` is set when that stream produced more than the cap and the
+/// overflow was drained-and-discarded rather than retained.
+pub(crate) struct CappedOutput {
+    pub status: std::process::ExitStatus,
+    pub stdout: Vec<u8>,
+    pub stdout_truncated: bool,
+    pub stderr: Vec<u8>,
+    pub stderr_truncated: bool,
+}
+
+/// Wait for `child` to exit while draining stdout+stderr CONCURRENTLY, retaining
+/// at most `limit` bytes from EACH stream. Bytes past the cap are read and
+/// discarded — so a chatty child never deadlocks on a full pipe — but never
+/// buffered, bounding capture memory no matter how much the subprocess writes.
+/// This replaces `Child::wait_with_output`, whose capture is unbounded (and then
+/// roughly doubled by a downstream `from_utf8_lossy().into_owned()`).
+///
+/// The child must have been spawned with piped stdout/stderr (as both
+/// [`Toolchain::run`] and [`Toolchain::compile`] do).
+pub(crate) async fn wait_with_capped_output(
+    mut child: tokio::process::Child,
+    limit: usize,
+) -> std::io::Result<CappedOutput> {
+    // Take the pipe handles out so `child.wait()` can be polled concurrently
+    // with the two readers; without concurrent draining a full pipe would block
+    // the child and `wait()` would never resolve (classic deadlock).
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (out_res, err_res, status) = tokio::join!(
+        read_capped(stdout, limit),
+        read_capped(stderr, limit),
+        child.wait(),
+    );
+    let (stdout, stdout_truncated) = out_res?;
+    let (stderr, stderr_truncated) = err_res?;
+    Ok(CappedOutput {
+        status: status?,
+        stdout,
+        stdout_truncated,
+        stderr,
+        stderr_truncated,
+    })
+}
+
+/// Read `reader` to EOF, retaining at most `limit` bytes and reporting whether
+/// anything past the cap was seen (and discarded). Reading continues past the
+/// cap so the writing end always reaches EOF and the child can exit.
+async fn read_capped<R>(reader: Option<R>, limit: usize) -> std::io::Result<(Vec<u8>, bool)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let Some(mut reader) = reader else {
+        return Ok((Vec::new(), false));
+    };
+    let mut retained = Vec::new();
+    let mut truncated = false;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        if retained.len() < limit {
+            let take = (limit - retained.len()).min(n);
+            retained.extend_from_slice(&chunk[..take]);
+            if take < n {
+                truncated = true;
+            }
+        } else {
+            // Over the cap: keep draining to EOF, but retain nothing.
+            truncated = true;
+        }
+    }
+    Ok((retained, truncated))
+}
+
+/// `from_utf8_lossy` a captured stream and, when it was truncated at the cap,
+/// append a single marker line so a consumer sees the output was cut rather than
+/// silently short.
+pub(crate) fn lossy_with_marker(bytes: &[u8], truncated: bool, limit: usize) -> String {
+    let mut s = String::from_utf8_lossy(bytes).into_owned();
+    if truncated {
+        s.push_str(&format!("\n[output truncated at {limit} bytes]"));
+    }
+    s
+}
 
 /// Spawn `cmd` as the leader of a brand-new process group, so that we can later
 /// signal the entire tree. `compact` execs `compactc.bin`; without this, killing

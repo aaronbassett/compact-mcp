@@ -56,14 +56,10 @@ impl ZkirStats {
 }
 
 pub fn stats(circuit: &str, path: &Path) -> Result<ZkirStats, CoreError> {
-    // Only a genuine "not found" is ArtifactMissing; other io failures surface as Io.
-    let text = std::fs::read_to_string(path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            CoreError::ArtifactMissing(path.to_path_buf())
-        } else {
-            CoreError::Io(e)
-        }
-    })?;
+    // Size-cap the read before it hits memory (a hostile 300 MiB `.zkir` would
+    // otherwise be slurped whole, then parsed). `read_to_string_capped` maps a
+    // genuine "not found" to ArtifactMissing and every other io failure to Io.
+    let text = super::read_to_string_capped(path)?;
     let z: Zkir = serde_json::from_str(&text).map_err(|e| CoreError::MalformedArtifact {
         path: path.to_path_buf(),
         reason: e.to_string(),
@@ -156,6 +152,23 @@ mod tests {
         assert!(
             matches!(err, CoreError::Io(_)),
             "expected Io for a non-NotFound read failure, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn stats_rejects_an_oversized_artifact_before_reading_it() {
+        // A `.zkir` whose reported size exceeds the cap is rejected on the
+        // metadata check, before `read_to_string` can buffer it. A sparse file
+        // (via `set_len`) yields the large reported length without allocating
+        // the bytes, so this proves the pre-read rejection cheaply.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.zkir");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(super::super::MAX_ARTIFACT_BYTES + 1).unwrap();
+        let err = stats("x", &path).unwrap_err();
+        assert!(
+            matches!(err, CoreError::MalformedArtifact { ref reason, .. } if reason.contains("maximum size")),
+            "expected an oversize rejection carrying the limit, got {err:?}"
         );
     }
 

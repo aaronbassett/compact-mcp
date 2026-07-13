@@ -45,6 +45,8 @@ impl CompactMcp {
             tasks: Arc::new(TaskStore::new(
                 Duration::from_secs(900),
                 Duration::from_secs(3600),
+                // Default admission cap; `with_config` overrides from `--max-tasks`.
+                1024,
             )),
             gate: Arc::new(BuildGate::new(1, 8)),
             compile_timeout_secs: 900,
@@ -70,6 +72,7 @@ impl CompactMcp {
         self.tasks = Arc::new(TaskStore::new(
             Duration::from_secs(c.default_task_ttl),
             Duration::from_secs(c.max_task_ttl),
+            c.max_tasks,
         ));
         self.gate = Arc::new(BuildGate::new(c.max_concurrent_builds, c.max_queued_builds));
         self.compile_timeout_secs = c.compile_timeout;

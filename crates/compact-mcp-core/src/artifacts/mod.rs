@@ -8,12 +8,79 @@ pub use contract_info::{Argument, Circuit, ContractInfo, LedgerField, TypeRef, W
 // with its own `stats` cannot collide at this level.
 pub use zkir::{Instruction, Zkir, ZkirStats, ZkirVersion};
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
 use crate::CoreError;
 use crate::workspace::is_single_normal_component;
+
+/// Largest compiler-produced artifact (`.zkir`, `contract-info.json`) we will
+/// read into memory, in bytes (64 MiB). Deliberately far above `MAX_SOURCE_BYTES`
+/// — a large circuit's `.zkir` dwarfs its hand-written source — while still
+/// bounding the peak memory a single artifact read (plus its `from_utf8` + JSON
+/// parse) can cost. This is a safety ceiling on trusted, in-workspace files, not
+/// an operational tuning knob, so it is a constant rather than a CLI flag,
+/// mirroring `MAX_SOURCE_BYTES`.
+pub const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Read a compiler artifact to a string, bounding the read at
+/// [`MAX_ARTIFACT_BYTES`] so an oversized artifact is never buffered whole just
+/// to be rejected — mirroring the source-path pre-check in the server's
+/// `read_input`.
+///
+/// The bound is enforced on the ACTUAL bytes read (`Read::take`), not merely on
+/// `metadata().len()`: a file that grows after the stat, or a special file whose
+/// `len()` under-reports, is still capped. The `metadata().len()` check is kept
+/// only as a cheap early reject that avoids opening an obviously huge file.
+///
+/// A genuine "not found" surfaces as [`CoreError::ArtifactMissing`]; every other
+/// read failure (permission, is-a-directory, non-UTF-8) surfaces as
+/// [`CoreError::Io`], so a present-but-unreadable file is never misreported as
+/// missing. An over-limit file surfaces as [`CoreError::MalformedArtifact`] (no
+/// dedicated variant: from the caller's view an unreadably huge artifact is as
+/// unusable as a malformed one, and the reason string says which).
+pub(crate) fn read_to_string_capped(path: &Path) -> Result<String, CoreError> {
+    let map_io = |e: std::io::Error| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            CoreError::ArtifactMissing(path.to_path_buf())
+        } else {
+            CoreError::Io(e)
+        }
+    };
+    let over_limit = || CoreError::MalformedArtifact {
+        path: path.to_path_buf(),
+        reason: format!("artifact exceeds maximum size (limit {MAX_ARTIFACT_BYTES} bytes)"),
+    };
+
+    // Cheap early reject on the stat'd size. A file that lies here (or grows after
+    // this stat) is still caught by the `take` bound below — this only avoids
+    // opening an obviously-huge file.
+    if std::fs::metadata(path).map_err(map_io)?.len() > MAX_ARTIFACT_BYTES {
+        return Err(over_limit());
+    }
+
+    // The REAL bound: read at most `MAX_ARTIFACT_BYTES + 1` bytes. Reading one
+    // byte past the cap lets us tell "exactly at the cap" from "over" without ever
+    // pulling an unbounded amount into memory (closing the stat-then-read TOCTOU).
+    let file = std::fs::File::open(path).map_err(map_io)?;
+    let mut buf = Vec::new();
+    file.take(MAX_ARTIFACT_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(map_io)?;
+    if buf.len() as u64 > MAX_ARTIFACT_BYTES {
+        return Err(over_limit());
+    }
+    // Preserve `read_to_string`'s contract: non-UTF-8 content is an
+    // `Io(InvalidData)` error, NOT a missing or malformed artifact.
+    String::from_utf8(buf).map_err(|e| {
+        CoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            e.utf8_error(),
+        ))
+    })
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CircuitArtifact {

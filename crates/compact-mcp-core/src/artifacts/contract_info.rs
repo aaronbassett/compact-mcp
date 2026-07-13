@@ -95,16 +95,12 @@ pub struct ContractInfo {
 
 impl ContractInfo {
     pub fn load(path: &Path) -> Result<Self, CoreError> {
-        // Only a genuine "not found" is an ArtifactMissing; a permission error,
-        // is-a-directory, or non-UTF-8/read failure must surface as Io so the
-        // caller is not misdirected into looking for a file that is actually there.
-        let text = std::fs::read_to_string(path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                CoreError::ArtifactMissing(path.to_path_buf())
-            } else {
-                CoreError::Io(e)
-            }
-        })?;
+        // Size-cap the read before it hits memory. `read_to_string_capped`
+        // preserves the prior error mapping: only a genuine "not found" is an
+        // ArtifactMissing; a permission error, is-a-directory, or non-UTF-8/read
+        // failure surfaces as Io so the caller is not misdirected into looking
+        // for a file that is actually there.
+        let text = super::read_to_string_capped(path)?;
         serde_json::from_str(&text).map_err(|e| CoreError::MalformedArtifact {
             path: path.to_path_buf(),
             reason: e.to_string(),
@@ -236,6 +232,23 @@ mod tests {
         assert!(
             matches!(err, CoreError::Io(_)),
             "expected Io for a non-NotFound read failure, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_an_oversized_artifact_before_reading_it() {
+        // A `contract-info.json` whose reported size exceeds the cap is rejected
+        // on the metadata check, before `read_to_string` can buffer it. The
+        // sparse file (via `set_len`) supplies the large reported length without
+        // allocating the bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contract-info.json");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(super::super::MAX_ARTIFACT_BYTES + 1).unwrap();
+        let err = ContractInfo::load(&path).unwrap_err();
+        assert!(
+            matches!(err, CoreError::MalformedArtifact { ref reason, .. } if reason.contains("maximum size")),
+            "expected an oversize rejection carrying the limit, got {err:?}"
         );
     }
 
