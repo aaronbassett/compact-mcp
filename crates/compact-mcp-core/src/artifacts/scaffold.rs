@@ -1,12 +1,13 @@
 use super::{ContractInfo, ts_type};
 
 /// Emit a TypeScript witness implementation stub. Parameter and return types
-/// come from `contract-info.json` (the compiler's own model) via [`ts_type`], so
-/// SCALAR types (`Field`/`Uint`/`Boolean`/`Bytes`/`Tuple`) match the generated
-/// `Witnesses<PS>` type exactly. Composite types `ts_type` does not yet model
-/// (`Vector`, structs, enums, `Maybe`/`Either`) fall back to `unknown`: the stub
-/// is a correct starting point, but such a parameter needs its real type filled
-/// in by hand. The body always throws, so the stub is never silently wrong.
+/// come from `contract-info.json` (the compiler's own model) via [`ts_type`],
+/// which mirrors the generated `Witnesses<PS>` type exactly for both scalar
+/// types (`Field`/`Uint`/`Boolean`/`Bytes`/`Tuple`) and composite ones
+/// (`Vector<T>` -> `T[]`, a struct -> `{ f: T, … }`, an enum -> `number`,
+/// including nesting like `Vector<2, Point>` -> `{ x: bigint, y: bigint }[]`).
+/// Only a type `ts_type` genuinely cannot represent falls back to `unknown` (and
+/// warns); the body always throws, so the stub is never silently wrong.
 pub fn witnesses_ts(info: &ContractInfo) -> String {
     let mut s = String::new();
     s.push_str("import type { Witnesses } from './contract/index.js';\n\n");
@@ -110,20 +111,43 @@ mod tests {
     }
 
     #[test]
-    fn a_composite_witness_type_falls_back_to_unknown_not_a_wrong_type() {
-        // `ts_type` does not yet model Vector/struct/enum; the stub must emit
-        // `unknown` (an honest placeholder for the developer to fill in), never a
-        // plausible-but-wrong concrete type.
+    fn composite_witness_types_get_precise_typescript_not_unknown() {
+        // Vector/struct/enum params — recoverable from contract-info.json — must
+        // flow through as their precise TS types (verified against the compiler's
+        // own index.d.ts), never the lossy `unknown` placeholder. The JSON shapes
+        // here are verbatim `compact compile --skip-zk` output.
         let info: ContractInfo = serde_json::from_str(
             r#"{"compiler-version":"0.31.1","language-version":"0.23.0","runtime-version":"0.16.0",
                 "circuits":[],"contracts":[],"ledger":[],
-                "witnesses":[{"name":"vecw","arguments":[
-                  {"name":"v","type":{"type-name":"Vector","length":3,"type":{"type-name":"Field"}}}],
-                 "result type":{"type-name":"Boolean"}}]}"#,
+                "witnesses":[
+                  {"name":"vec_w","arguments":[
+                    {"name":"v","type":{"type-name":"Vector","length":3,"type":{"type-name":"Field"}}}],
+                   "result type":{"type-name":"Boolean"}},
+                  {"name":"struct_w","arguments":[
+                    {"name":"p","type":{"type-name":"Struct","name":"Point","elements":[
+                      {"name":"x","type":{"type-name":"Field"}},
+                      {"name":"y","type":{"type-name":"Field"}}]}}],
+                   "result type":{"type-name":"Field"}},
+                  {"name":"enum_w","arguments":[
+                    {"name":"c","type":{"type-name":"Enum","name":"Colour","elements":["red","green"]}}],
+                   "result type":{"type-name":"Field"}},
+                  {"name":"vec_struct_w","arguments":[
+                    {"name":"vs","type":{"type-name":"Vector","length":2,"type":{
+                      "type-name":"Struct","name":"Point","elements":[
+                        {"name":"x","type":{"type-name":"Field"}},
+                        {"name":"y","type":{"type-name":"Field"}}]}}}],
+                   "result type":{"type-name":"Field"}}]}"#,
         )
         .unwrap();
         let ts = witnesses_ts(&info);
-        assert!(ts.contains("v_0: unknown"), "{ts}");
+        assert!(
+            !ts.contains("unknown"),
+            "no param should degrade to unknown:\n{ts}"
+        );
+        assert!(ts.contains("v_0: bigint[]"), "{ts}");
+        assert!(ts.contains("p_0: { x: bigint, y: bigint }"), "{ts}");
+        assert!(ts.contains("c_0: number"), "{ts}");
+        assert!(ts.contains("vs_0: { x: bigint, y: bigint }[]"), "{ts}");
     }
 
     /// Guards the `_0` parameter-suffix assumption against a compiler change.

@@ -87,3 +87,37 @@ fn witness_scaffold_output_is_stable() {
     // Plain text snapshot — this one is read by humans, not parsed.
     insta::assert_snapshot!(artifacts::scaffold::witnesses_ts(&info));
 }
+
+// Locks the composite-type scaffold (issue #11) against real `compact compile
+// --skip-zk` output: `Vector<3, Field>` -> `bigint[]`, `struct Point` ->
+// `{ x: bigint, y: bigint }`, `enum Colour` -> `number`, and `Vector<2, Point>`
+// -> `{ x: bigint, y: bigint }[]`. The witness-parameter JSON below is verbatim
+// compiler 0.31.1 output, and each generated TS parameter type matches the
+// witness signatures the same build wrote to `index.d.ts`.
+#[test]
+fn composite_witness_scaffold_output_is_stable() {
+    let info: artifacts::ContractInfo = serde_json::from_str(
+        r#"{"compiler-version":"0.31.1","language-version":"0.23.0","runtime-version":"0.16.0",
+            "circuits":[],"contracts":[],"ledger":[],
+            "witnesses":[
+              {"name":"vec_w","arguments":[
+                 {"name":"v","type":{"type-name":"Vector","length":3,"type":{"type-name":"Field"}}}],
+               "result type":{"type-name":"Field"}},
+              {"name":"struct_w","arguments":[
+                 {"name":"p","type":{"type-name":"Struct","name":"Point","elements":[
+                    {"name":"x","type":{"type-name":"Field"}},
+                    {"name":"y","type":{"type-name":"Field"}}]}}],
+               "result type":{"type-name":"Field"}},
+              {"name":"enum_w","arguments":[
+                 {"name":"c","type":{"type-name":"Enum","name":"Colour","elements":["red","green","blue"]}}],
+               "result type":{"type-name":"Field"}},
+              {"name":"vec_struct_w","arguments":[
+                 {"name":"vs","type":{"type-name":"Vector","length":2,"type":{
+                    "type-name":"Struct","name":"Point","elements":[
+                      {"name":"x","type":{"type-name":"Field"}},
+                      {"name":"y","type":{"type-name":"Field"}}]}}}],
+               "result type":{"type-name":"Field"}}]}"#,
+    )
+    .unwrap();
+    insta::assert_snapshot!(artifacts::scaffold::witnesses_ts(&info));
+}
