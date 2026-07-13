@@ -1,0 +1,26 @@
+---
+source: crates/compact-mcp-core/tests/snapshots.rs
+expression: "artifacts::scaffold::witnesses_ts(&info)"
+---
+import type { Witnesses } from './contract/index.js';
+
+export type PrivateState = Record<string, never>;
+
+export const witnesses: Witnesses<PrivateState> = {
+  // vec_w(context: WitnessContext<Ledger, PrivateState>, v_0: bigint[]): [PrivateState, bigint]
+  vec_w(context, v_0) {
+    throw new Error('witness `vec_w` is not implemented');
+  },
+  // struct_w(context: WitnessContext<Ledger, PrivateState>, p_0: { x: bigint, y: bigint }): [PrivateState, bigint]
+  struct_w(context, p_0) {
+    throw new Error('witness `struct_w` is not implemented');
+  },
+  // enum_w(context: WitnessContext<Ledger, PrivateState>, c_0: number): [PrivateState, bigint]
+  enum_w(context, c_0) {
+    throw new Error('witness `enum_w` is not implemented');
+  },
+  // vec_struct_w(context: WitnessContext<Ledger, PrivateState>, vs_0: { x: bigint, y: bigint }[]): [PrivateState, bigint]
+  vec_struct_w(context, vs_0) {
+    throw new Error('witness `vec_struct_w` is not implemented');
+  },
+};
