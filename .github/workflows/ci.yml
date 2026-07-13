@@ -3,24 +3,32 @@ on: [push, pull_request]
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Bound a hung build/test; well above realistic runtime, far below the 6h default.
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.90
+      # Actions pinned to full-length commit SHAs (Dependabot still bumps them).
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@0176485ebe2f605bde554dd99f804beeaf7db3e2 # 1.90
         with: { components: rustfmt, clippy }
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo fmt --all --check
       # The shipped binary has no `testing` feature; check that config compiles
       # too, so production code can never start depending on test-only modules.
       - run: cargo check --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked --features testing -- -D warnings
+      # Guard the developer-default invocation (no `--features testing`) as well,
+      # so the baseline suite can't silently rot while only the featured run is CI'd.
+      - run: cargo test --workspace --locked
       - run: cargo test --workspace --locked --features testing
       - name: core must not depend on rmcp
         run: |
           # Write to a file first: piping straight into grep makes a `cargo tree`
           # failure indistinguishable from "no rmcp found", so the gate would
-          # silently pass when the tool itself broke.
-          cargo tree -p compact-mcp-core --prefix none > core-tree.txt
-          if grep -qx 'rmcp v.*' core-tree.txt; then
+          # silently pass when the tool itself broke. Keep the file under
+          # $RUNNER_TEMP so a local run doesn't litter the repo root.
+          tree_file="$RUNNER_TEMP/core-tree.txt"
+          cargo tree -p compact-mcp-core --prefix none > "$tree_file"
+          if grep -qx 'rmcp v.*' "$tree_file"; then
             echo "::error::compact-mcp-core must not depend on rmcp"; exit 1
           fi
 
@@ -28,15 +36,32 @@ jobs:
     # Tests that shell out to a real `compact`. Kept separate so the fast job
     # above stays hermetic.
     runs-on: ubuntu-latest
+    # Installs the compact CLI + a pinned compiler, then builds/runs the
+    # toolchain suite; a little more headroom than the hermetic job.
+    timeout-minutes: 30
     env:
       COMPACT_VERSION: "0.31.1"
+      # Pin the `compact` CLI installer to a specific release (not `latest`) and
+      # verify the script's own bytes before running it. `latest` resolved to
+      # this release at the time of writing; bump both fields together.
+      # https://github.com/midnightntwrk/compact/releases/tag/compact-v0.5.1
+      COMPACT_CLI_VERSION: "compact-v0.5.1"
+      COMPACT_INSTALLER_SHA256: "85e74a53ae4a67b31fa4d854f3b6ffb4c29f7c53e3372c5008b6a4729a8b4a73"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.90
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@0176485ebe2f605bde554dd99f804beeaf7db3e2 # 1.90
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: install the compact CLI
         run: |
-          curl --proto '=https' --tlsv1.2 -LsSf https://github.com/midnightntwrk/compact/releases/latest/download/compact-installer.sh | sh
+          # Download the pinned installer, verify its sha256, then run it. A moved
+          # or compromised release can no longer silently change what executes in
+          # CI. The cargo-dist installer in turn verifies the sha256 of the
+          # platform tarball it downloads, so the whole chain is checksum-gated.
+          installer="$RUNNER_TEMP/compact-installer.sh"
+          url="https://github.com/midnightntwrk/compact/releases/download/${COMPACT_CLI_VERSION}/compact-installer.sh"
+          curl --proto '=https' --tlsv1.2 -LsSf "$url" -o "$installer"
+          echo "${COMPACT_INSTALLER_SHA256}  ${installer}" | sha256sum -c -
+          sh "$installer"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: install a pinned compiler
         run: compact update "$COMPACT_VERSION"
