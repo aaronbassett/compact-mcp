@@ -141,11 +141,38 @@ mod tests {
     #[tokio::test]
     #[cfg_attr(not(feature = "toolchain-tests"), ignore)]
     async fn compiler_version_pin_is_honoured() {
-        let tc = crate::toolchain::Toolchain::new("compact", Some("0.31.0".into()));
-        let out = tc
-            .run_compile(&["--version"], &CancellationToken::new())
+        // Derive the expected version from the compiler that is ACTUALLY
+        // installed rather than a hard-coded literal, so this can never drift
+        // when CI bumps `COMPACT_VERSION` (the mismatch that made issue #15's
+        // `toolchain` job red). The un-pinned default compiler is, by
+        // construction, installed, so pinning `+VERSION` to that exact version
+        // must resolve and report the same version back. If the `+VERSION`
+        // token were dropped or mis-forwarded, the pinned call would report a
+        // different (or empty) version and this assertion would catch it.
+        let ct = CancellationToken::new();
+
+        // `compact compile --version` with no pin: the default/current
+        // compiler, guaranteed to be the one installed by `compact update`.
+        let default_version = crate::toolchain::Toolchain::new("compact", None)
+            .run_compile(&["--version"], &ct)
             .await
-            .unwrap();
-        assert_eq!(out.stdout.trim(), "0.31.0");
+            .unwrap()
+            .stdout
+            .trim()
+            .to_string();
+        assert!(
+            semver::Version::parse(&default_version).is_ok(),
+            "un-pinned `compact compile --version` did not report a semver: {default_version:?}"
+        );
+
+        // Pin explicitly to that version: the `+VERSION` token must reach
+        // `compact compile` and the reported version must match the pin exactly.
+        let pinned = crate::toolchain::Toolchain::new("compact", Some(default_version.clone()));
+        let out = pinned.run_compile(&["--version"], &ct).await.unwrap();
+        assert_eq!(
+            out.stdout.trim(),
+            default_version,
+            "pinned `compact compile +{default_version} --version` did not honour the pin"
+        );
     }
 }
